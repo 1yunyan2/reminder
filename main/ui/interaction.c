@@ -409,13 +409,18 @@ static void interaction_play_blocking(robot_emotion_t target_emotion)
 
     ESP_LOGI(TAG, ">>> 开始执行情绪动画: %d (%s) <<<", (int)target_emotion, cmd->screen_anim);
 
-    // ── 2. 屏幕动画（预留：发消息给 LVGL 任务）──────────────────────────────
-    // TODO: ui_manager_play_anim(cmd->screen_anim);
-    ESP_LOGI(TAG, "-> [预留] 屏幕动画: %s", cmd->screen_anim);
+    // ── 2. 屏幕情绪显示（随机从6个固定标签中选一个，后续替换为真实动画）──────
+    // 架构说明：cmd->screen_anim 是动画标识符，最终传给 UI 层：
+    //   ui_play_animation(cmd->screen_anim) → LVGL 任务收到后播放对应动画
+    // 目前 UI 动画未完成，用随机情绪文字临时占位
+    static const char *s_face_labels[] = {"开心", "好奇", "傲娇", "怕痒", "委屈", "犯困"};
+    const char *rand_label = s_face_labels[esp_random() % 6];
+    ESP_LOGI(TAG, "📺 屏幕显示: %s  （动画槽: %s）", rand_label, cmd->screen_anim);
+    // TODO: ui_play_animation(cmd->screen_anim);
 
-    // ── 3. 音频播放（预留：发消息给音频播放任务）────────────────────────────
+    // ── 3. 音频播放（预留）──────────────────────────────────────────────────
     // TODO: audio_player_play_file(cmd->audio_file);
-    ESP_LOGI(TAG, "-> [预留] 音效文件: %s", cmd->audio_file);
+    ESP_LOGI(TAG, "🔊 音效槽: %s", cmd->audio_file);
 
     // ── 4. 震动马达 ──────────────────────────────────────────────────────────
     trigger_vibration_motor(cmd->motor_mode);
@@ -430,27 +435,23 @@ static void interaction_play_blocking(robot_emotion_t target_emotion)
 
     for (uint8_t loop = 0; loop < max_loop; loop++)
     {
-        // 前半段（如左转/前摆）
-        if (loop < cmd->head.count)
-            bsp_servo_move_smooth(CH_HEAD, cmd->head.angle_1, cmd->head.speed);
-        if (loop < cmd->left_arm.count)
-            bsp_servo_move_smooth(CH_L_ARM, cmd->left_arm.angle_1, cmd->left_arm.speed);
-        if (loop < cmd->right_arm.count)
-            bsp_servo_move_smooth(CH_R_ARM, cmd->right_arm.angle_1, cmd->right_arm.speed);
+        // 前半段：三轴同时运动到 angle_1（未参与的轴保持 90°）
+        bsp_servo_move_all_parallel(
+            (loop < cmd->head.count)      ? cmd->head.angle_1      : 90.0f,
+            (loop < cmd->left_arm.count)  ? cmd->left_arm.angle_1  : 90.0f,
+            (loop < cmd->right_arm.count) ? cmd->right_arm.angle_1 : 90.0f,
+            cmd->head.speed);
 
-        // 后半段（如右转/后摆）
-        if (loop < cmd->head.count)
-            bsp_servo_move_smooth(CH_HEAD, cmd->head.angle_2, cmd->head.speed);
-        if (loop < cmd->left_arm.count)
-            bsp_servo_move_smooth(CH_L_ARM, cmd->left_arm.angle_2, cmd->left_arm.speed);
-        if (loop < cmd->right_arm.count)
-            bsp_servo_move_smooth(CH_R_ARM, cmd->right_arm.angle_2, cmd->right_arm.speed);
+        // 后半段：三轴同时运动到 angle_2
+        bsp_servo_move_all_parallel(
+            (loop < cmd->head.count)      ? cmd->head.angle_2      : 90.0f,
+            (loop < cmd->left_arm.count)  ? cmd->left_arm.angle_2  : 90.0f,
+            (loop < cmd->right_arm.count) ? cmd->right_arm.angle_2 : 90.0f,
+            cmd->head.speed);
     }
 
-    // ── 6. 全轴归中（恢复待机姿态）──────────────────────────────────────────
-    bsp_servo_move_smooth(CH_HEAD, 90.0f, SERVO_SPEED_MID);
-    bsp_servo_move_smooth(CH_L_ARM, 90.0f, SERVO_SPEED_MID);
-    bsp_servo_move_smooth(CH_R_ARM, 90.0f, SERVO_SPEED_MID);
+    // ── 6. 全轴同时归中（恢复待机姿态）──────────────────────────────────────
+    bsp_servo_move_all_parallel(90.0f, 90.0f, 90.0f, SERVO_SPEED_MID);
 
     ESP_LOGI(TAG, ">>> 情绪动作执行完毕: %d <<<", (int)target_emotion);
 }

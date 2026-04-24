@@ -160,6 +160,66 @@ void test_red_screen(void)
     lv_obj_center(label);                                                     // 将标签居中显示
 }
 
+// ── 情绪叠加层（覆盖在 GIF 上方，触摸时出现，3秒后自动消失）────────────────
+static lv_obj_t   *s_emo_panel    = NULL;
+static lv_obj_t   *s_emo_name_lbl = NULL;
+static lv_obj_t   *s_emo_desc_lbl = NULL;
+static lv_timer_t *s_emo_timer    = NULL;
+
+static void hide_emotion_cb(lv_timer_t *t)
+{
+    if (s_emo_panel) lv_obj_add_flag(s_emo_panel, LV_OBJ_FLAG_HIDDEN);
+    s_emo_timer = NULL; // 单次定时器，自动删除，这里只清指针
+}
+
+void ui_show_emotion(const char *name, const char *anim_desc)
+{
+    if (!lvgl_port_lock(100)) return;
+
+    lv_obj_t *scr = lv_screen_active();
+
+    // 首次创建面板（后续复用）
+    if (s_emo_panel == NULL)
+    {
+        // 半透明深色圆角背景，240 宽（屏宽）×90 高，贴底居中
+        s_emo_panel = lv_obj_create(scr);
+        lv_obj_set_size(s_emo_panel, 220, 90);
+        lv_obj_align(s_emo_panel, LV_ALIGN_BOTTOM_MID, 0, -8);
+        lv_obj_set_style_bg_color(s_emo_panel, lv_color_hex(0x111111), 0);
+        lv_obj_set_style_bg_opa(s_emo_panel, LV_OPA_80, 0);
+        lv_obj_set_style_border_color(s_emo_panel, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_border_opa(s_emo_panel, LV_OPA_30, 0);
+        lv_obj_set_style_border_width(s_emo_panel, 1, 0);
+        lv_obj_set_style_radius(s_emo_panel, 12, 0);
+        lv_obj_clear_flag(s_emo_panel, LV_OBJ_FLAG_SCROLLABLE);
+
+        // 情绪名（大字，白色，居上）
+        s_emo_name_lbl = lv_label_create(s_emo_panel);
+        lv_obj_set_style_text_color(s_emo_name_lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_align(s_emo_name_lbl, LV_ALIGN_TOP_MID, 0, 8);
+
+        // 动画描述（小字，灰色，居下）
+        s_emo_desc_lbl = lv_label_create(s_emo_panel);
+        lv_obj_set_style_text_color(s_emo_desc_lbl, lv_color_hex(0xAAAAAA), 0);
+        lv_label_set_long_mode(s_emo_desc_lbl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(s_emo_desc_lbl, 200);
+        lv_obj_align(s_emo_desc_lbl, LV_ALIGN_BOTTOM_MID, 0, -8);
+    }
+
+    lv_label_set_text(s_emo_name_lbl, name);
+    lv_label_set_text(s_emo_desc_lbl, anim_desc);
+    lv_obj_clear_flag(s_emo_panel, LV_OBJ_FLAG_HIDDEN);
+
+    // 重置/启动 3 秒自动隐藏定时器
+    if (s_emo_timer != NULL)
+        lv_timer_reset(s_emo_timer);
+    else
+        s_emo_timer = lv_timer_create(hide_emotion_cb, 3000, NULL);
+    lv_timer_set_repeat_count(s_emo_timer, 1); // 单次触发
+
+    lvgl_port_unlock();
+}
+
 void ui_init(void)
 {
     app_lvgl_init();

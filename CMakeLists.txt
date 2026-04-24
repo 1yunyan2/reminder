@@ -6,3 +6,4 @@ cmake_minimum_required(VERSION 3.16)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(servo)
+spiffs_create_partition_image(assets my_assets FLASH_IN_PROJECT)

@@ -78,3 +78,10 @@ void ui_update_text(const char *text);
  * @param timeout_ms 显示时长（毫秒）
  */
 void ui_show_notification(const char *title, const char *message, uint32_t timeout_ms);
+
+/**
+ * @brief 在屏幕底部显示当前情绪文字（3秒后自动隐藏，GIF 继续在后面播放）
+ * @param name      情绪名称，如 "开心"
+ * @param anim_desc 动画描述，如 "眯眼笑+冒星星"
+ */
+void ui_show_emotion(const char *name, const char *anim_desc);

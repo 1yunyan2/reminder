@@ -170,6 +170,15 @@ void bsp_board_servo_init(bsp_board_t *bsp_board);
  */
 void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms);
 
+/**
+ * @brief 三轴舵机同时平滑运动到各自目标（并行插值，不割裂）
+ * @param head_target  头部目标角度
+ * @param larm_target  左臂目标角度
+ * @param rarm_target  右臂目标角度
+ * @param step_ms      最长轴每步延时，对应 SERVO_SPEED_xxx
+ */
+void bsp_servo_move_all_parallel(float head_target, float larm_target, float rarm_target, uint32_t step_ms);
+
 // ─── 7. 触摸事件与接口 (整合自 bsp_touch.h) ───────────────────────────────
 
 /**
