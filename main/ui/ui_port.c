@@ -7,6 +7,51 @@
 #include "bsp/bsp_config.h"
 #include "bsp/bsp_board.h"
 #include "gif_eye.h"
+#include "esp_spiffs.h"
+#include "esp_log.h"
+
+// 声明一个初始化 SPIFFS 的函数
+void init_spiffs(void)
+{
+    ESP_LOGI("SPIFFS", "Initializing SPIFFS");
+
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",         // 这是虚拟路径的前缀，也就是挂载点
+        .partition_label = "assets",    // ✅ 必须和你 partitions.csv 里的名字一模一样
+        .max_files = 5,                 // 最多同时打开的文件数
+        .format_if_mount_failed = false // 既然我们已经烧录了镜像，千万别格式化它
+    };
+
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+
+    if (ret != ESP_OK)
+    {
+        if (ret == ESP_FAIL)
+        {
+            ESP_LOGE("SPIFFS", "Failed to mount or format filesystem");
+        }
+        else if (ret == ESP_ERR_NOT_FOUND)
+        {
+            ESP_LOGE("SPIFFS", "Failed to find SPIFFS partition");
+        }
+        else
+        {
+            ESP_LOGE("SPIFFS", "Failed to initialize SPIFFS (%s)", esp_err_to_name(ret));
+        }
+        return;
+    }
+
+    size_t total = 0, used = 0;
+    ret = esp_spiffs_info(conf.partition_label, &total, &used);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE("SPIFFS", "Failed to get SPIFFS partition information (%s)", esp_err_to_name(ret));
+    }
+    else
+    {
+        ESP_LOGI("SPIFFS", "Partition size: total: %d, used: %d", total, used);
+    }
+}
 static const char *TAG = "UI_PORT";
 // 在文件开头声明
 lv_display_t *lvgl_disp = NULL;
@@ -60,6 +105,28 @@ void eye_gif_show(void)
     ESP_LOGI("UI", "GIF 动画启动，当前 PSRAM 剩余: %d bytes", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
+void eye_gif_show2(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
+
+    if (gif_obj != NULL)
+    {
+        lv_obj_del(gif_obj);
+    }
+
+    // 创建 GIF 对象
+    gif_obj = lv_gif_create(scr);
+
+    // ✅ 核心改变：不再传入描述符或数组，直接传入文件路径！
+    // 这里的 S: 对应 lv_conf.h 里的盘符，eye.gif 是你放在 data 文件夹里的文件名
+    lv_gif_set_src(gif_obj, "S:eye.gif");
+
+    lv_obj_center(gif_obj);
+
+    ESP_LOGI("UI", "GIF 从外部 Flash 启动，当前 PSRAM 剩余: %d bytes", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
 // 1. 声明你的图片数据数组（确保这个名字和你在 .c 文件里定义的一致）
 extern const uint8_t gImage_picture[];
 
@@ -103,7 +170,7 @@ static esp_err_t app_lvgl_init(void)
 
     /* 1. 初始化 LVGL 核心任务 */
     const lvgl_port_cfg_t lvgl_cfg = {
-        .task_priority = 4,
+        .task_priority = 3, // LVGL 任务优先级（根据实际情况调整，确保高于其他业务任务）
         .task_stack = 8192,
         .task_affinity = 1,
         .task_max_sleep_ms = 500,
@@ -116,14 +183,14 @@ static esp_err_t app_lvgl_init(void)
     /* 2. 应用 PSRAM 双缓冲策略 */
     ESP_LOGI(TAG, "正在应用 PSRAM 双缓冲 + SRAM DMA 传输策略...");
     const lvgl_port_display_cfg_t disp_cfg = {
-        .io_handle = board->lcd_io,             // LCD IO 句柄
-        .panel_handle = board->lcd_panel,       // LCD 面板句柄
-        .buffer_size = BSP_LCD_WIDTH * 10,      // 缓冲区大小（1/4 屏）
-        .double_buffer = true,                  // 启用双缓冲
-        .hres = BSP_LCD_WIDTH,                  // 水平分辨率
-        .vres = BSP_LCD_HEIGHT,                 // 垂直分辨率
-        .monochrome = false,                    // 非单色屏
-        .color_format = LV_COLOR_FORMAT_RGB565, // RGB565 格式
+        .io_handle = board->lcd_io,                          // LCD IO 句柄
+        .panel_handle = board->lcd_panel,                    // LCD 面板句柄
+        .buffer_size = (BSP_LCD_WIDTH * BSP_LCD_HEIGHT) / 2, // 缓冲区大小（1/2 屏）
+        .double_buffer = true,                               // 启用双缓冲
+        .hres = BSP_LCD_WIDTH,                               // 水平分辨率
+        .vres = BSP_LCD_HEIGHT,                              // 垂直分辨率
+        .monochrome = false,                                 // 非单色屏
+        .color_format = LV_COLOR_FORMAT_RGB565,              // RGB565 格式
         .rotation = {
             .swap_xy = true,   // 交换 X/Y 轴
             .mirror_x = false, // X 轴镜像
@@ -138,6 +205,10 @@ static esp_err_t app_lvgl_init(void)
     lvgl_disp = lvgl_port_add_disp(&disp_cfg);
     if (lvgl_disp != NULL)
     {
+        // ──────────────────────────────────────────────────────
+        // ✅ 修改点 3：强制关闭差分刷新，开启全局/全屏刷新 (核心代码)
+        // ──────────────────────────────────────────────────────
+        lv_display_set_render_mode(lvgl_disp, LV_DISPLAY_RENDER_MODE_FULL);
         // 关键：现在才可以调用 lv_screen_active()
         lv_obj_t *screen = lv_screen_active();
         if (screen != NULL)
@@ -160,75 +231,16 @@ void test_red_screen(void)
     lv_obj_center(label);                                                     // 将标签居中显示
 }
 
-// ── 情绪叠加层（覆盖在 GIF 上方，触摸时出现，3秒后自动消失）────────────────
-static lv_obj_t   *s_emo_panel    = NULL;
-static lv_obj_t   *s_emo_name_lbl = NULL;
-static lv_obj_t   *s_emo_desc_lbl = NULL;
-static lv_timer_t *s_emo_timer    = NULL;
-
-static void hide_emotion_cb(lv_timer_t *t)
-{
-    if (s_emo_panel) lv_obj_add_flag(s_emo_panel, LV_OBJ_FLAG_HIDDEN);
-    s_emo_timer = NULL; // 单次定时器，自动删除，这里只清指针
-}
-
-void ui_show_emotion(const char *name, const char *anim_desc)
-{
-    if (!lvgl_port_lock(100)) return;
-
-    lv_obj_t *scr = lv_screen_active();
-
-    // 首次创建面板（后续复用）
-    if (s_emo_panel == NULL)
-    {
-        // 半透明深色圆角背景，240 宽（屏宽）×90 高，贴底居中
-        s_emo_panel = lv_obj_create(scr);
-        lv_obj_set_size(s_emo_panel, 220, 90);
-        lv_obj_align(s_emo_panel, LV_ALIGN_BOTTOM_MID, 0, -8);
-        lv_obj_set_style_bg_color(s_emo_panel, lv_color_hex(0x111111), 0);
-        lv_obj_set_style_bg_opa(s_emo_panel, LV_OPA_80, 0);
-        lv_obj_set_style_border_color(s_emo_panel, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_set_style_border_opa(s_emo_panel, LV_OPA_30, 0);
-        lv_obj_set_style_border_width(s_emo_panel, 1, 0);
-        lv_obj_set_style_radius(s_emo_panel, 12, 0);
-        lv_obj_clear_flag(s_emo_panel, LV_OBJ_FLAG_SCROLLABLE);
-
-        // 情绪名（大字，白色，居上）
-        s_emo_name_lbl = lv_label_create(s_emo_panel);
-        lv_obj_set_style_text_color(s_emo_name_lbl, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_align(s_emo_name_lbl, LV_ALIGN_TOP_MID, 0, 8);
-
-        // 动画描述（小字，灰色，居下）
-        s_emo_desc_lbl = lv_label_create(s_emo_panel);
-        lv_obj_set_style_text_color(s_emo_desc_lbl, lv_color_hex(0xAAAAAA), 0);
-        lv_label_set_long_mode(s_emo_desc_lbl, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(s_emo_desc_lbl, 200);
-        lv_obj_align(s_emo_desc_lbl, LV_ALIGN_BOTTOM_MID, 0, -8);
-    }
-
-    lv_label_set_text(s_emo_name_lbl, name);
-    lv_label_set_text(s_emo_desc_lbl, anim_desc);
-    lv_obj_clear_flag(s_emo_panel, LV_OBJ_FLAG_HIDDEN);
-
-    // 重置/启动 3 秒自动隐藏定时器
-    if (s_emo_timer != NULL)
-        lv_timer_reset(s_emo_timer);
-    else
-        s_emo_timer = lv_timer_create(hide_emotion_cb, 3000, NULL);
-    lv_timer_set_repeat_count(s_emo_timer, 1); // 单次触发
-
-    lvgl_port_unlock();
-}
-
 void ui_init(void)
 {
+    init_spiffs();
     app_lvgl_init();
 
     if (lvgl_port_lock(1000))
     {
         // ✅ 先测试 GIF，注释掉红屏
-        eye_gif_show();
-        // eye_gif_show2();
+        // eye_gif_show();
+        eye_gif_show2();
         // show_my_picture();
         // test_red_screen();
 

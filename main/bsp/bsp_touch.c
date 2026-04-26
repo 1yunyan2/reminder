@@ -71,7 +71,7 @@ static const emo_entry_t g_emo_abdomen_back[] = {
 static void show_random_emotion(const emo_entry_t *group, size_t count)
 {
     const emo_entry_t *e = &group[esp_random() % count];
-    ui_show_emotion(e->name, e->anim);
+    // ui_show_emotion(e->name, e->anim);
     ESP_LOGI("TOUCH", "情绪: %s | %s", e->name, e->anim);
 }
 #define SHOW_EMO(group) show_random_emotion(group, sizeof(group) / sizeof(group[0]))
@@ -84,8 +84,8 @@ static QueueHandle_t s_touch_event_queue = NULL;
 #define TOUCH_THRESH_PERCENT 0.15f // 15%相对阈值（提高防串扰）
 #define POWER_ON_MASK_TIME 2000    // 上电屏蔽2秒
 #define TOUCH_MIN_DELTA 50000      // 绝对变化量阈值（提高防串扰，需实际测量调整）
-#define SHORT_PRESS_MIN_MS 800     // 短按最短持续时间（ms）
-#define LONG_PRESS_MS 1500         // 长按判定时间（ms）
+#define SHORT_PRESS_MIN_MS 1000    // 短按最短持续时间（ms）
+#define LONG_PRESS_MS 1800         // 长按判定时间（ms）
 #define RELEASE_DEBOUNCE 4         // 连续 4 次读到未按才认为真正释放，防止按住时抖动误触发
 
 typedef struct
