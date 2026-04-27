@@ -36,6 +36,9 @@ static void servo_test_task(void *arg)
 
 void app_main(void)
 {
+    // 等待 USB-JTAG CDC 连接建立，避免打印阻塞导致看门狗触发
+    vTaskDelay(pdMS_TO_TICKS(500));
+
     bsp_board_t *board = bsp_board_get_instance();
 
     // 舵机初始化（三轴缓慢归中到 90°）
