@@ -22,7 +22,7 @@ void init_spiffs(void)
         .format_if_mount_failed = false // 既然我们已经烧录了镜像，千万别格式化它
     };
 
-    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    esp_err_t ret = esp_vfs_spiffs_register(&conf); // 挂载文件系统
 
     if (ret != ESP_OK)
     {
@@ -111,17 +111,18 @@ void eye_gif_show2(void)
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
 
-    if (gif_obj != NULL)
+    if (gif_obj != NULL) // 如果之前已经创建过 GIF 对象，先删除它
     {
-        lv_obj_del(gif_obj);
+        lv_obj_del(gif_obj); // 删除 GIF 对象
     }
 
     // 创建 GIF 对象
     gif_obj = lv_gif_create(scr);
-
+    lv_gif_set_color_format(gif_obj, LV_COLOR_FORMAT_RGB565); // 直接设置为 RGB565，绕过解码器的格式判断，强制使用 RGB565 解码（如果 GIF 库支持的话）
     // ✅ 核心改变：不再传入描述符或数组，直接传入文件路径！
     // 这里的 S: 对应 lv_conf.h 里的盘符，eye.gif 是你放在 data 文件夹里的文件名
-    lv_gif_set_src(gif_obj, "S:eye.gif");
+    // lv_gif_set_src(gif_obj, "S:eye.gif");
+    lv_gif_set_src(gif_obj, "S:/eye.gif");
 
     lv_obj_center(gif_obj);
 
@@ -140,6 +141,7 @@ const lv_image_dsc_t my_raw_image = {
     .data_size = 149280,                 // 数组总大小
     .data = gImage_picture,              // 指向数组
 };
+// 2. 创建一个显示图片的函数
 void show_my_picture(void)
 {
     // 创建一个图像对象
@@ -175,6 +177,7 @@ static esp_err_t app_lvgl_init(void)
         .task_affinity = 1,
         .task_max_sleep_ms = 500,
         .timer_period_ms = 10,
+
     };
     esp_err_t err = lvgl_port_init(&lvgl_cfg);
     if (err != ESP_OK)
@@ -185,7 +188,7 @@ static esp_err_t app_lvgl_init(void)
     const lvgl_port_display_cfg_t disp_cfg = {
         .io_handle = board->lcd_io,                          // LCD IO 句柄
         .panel_handle = board->lcd_panel,                    // LCD 面板句柄
-        .buffer_size = (BSP_LCD_WIDTH * BSP_LCD_HEIGHT) / 2, // 缓冲区大小（1/2 屏）
+        .buffer_size = (BSP_LCD_WIDTH * BSP_LCD_HEIGHT) / 4, // 缓冲区大小（1/4 屏）
         .double_buffer = true,                               // 启用双缓冲
         .hres = BSP_LCD_WIDTH,                               // 水平分辨率
         .vres = BSP_LCD_HEIGHT,                              // 垂直分辨率
@@ -202,19 +205,20 @@ static esp_err_t app_lvgl_init(void)
             .buff_spiram = true, // 使用 SPIRAM 分配缓冲区
         }};
 
-    lvgl_disp = lvgl_port_add_disp(&disp_cfg);
+    lvgl_disp = lvgl_port_add_disp(&disp_cfg); // 添加 LVGL 显示设备
     if (lvgl_disp != NULL)
     {
-        // ──────────────────────────────────────────────────────
-        // ✅ 修改点 3：强制关闭差分刷新，开启全局/全屏刷新 (核心代码)
-        // ──────────────────────────────────────────────────────
-        lv_display_set_render_mode(lvgl_disp, LV_DISPLAY_RENDER_MODE_FULL);
-        // 关键：现在才可以调用 lv_screen_active()
-        lv_obj_t *screen = lv_screen_active();
-        if (screen != NULL)
+        lv_display_set_render_mode(lvgl_disp, LV_DISPLAY_RENDER_MODE_PARTIAL);
+
+        if (lvgl_port_lock(1000))
         {
-            lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
-            lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+            lv_obj_t *screen = lv_screen_active();
+            if (screen != NULL)
+            {
+                lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
+                lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+            }
+            lvgl_port_unlock();
         }
     }
     return ESP_OK;

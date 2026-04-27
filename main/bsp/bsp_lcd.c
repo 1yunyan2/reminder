@@ -86,10 +86,15 @@ void bsp_board_lcd_init(bsp_board_t *bsp_board)
     // ── 步骤 8：颜色反转（IPS 屏必须开启，否则颜色像底片负片）──────────────
     // 普通 TN 屏不需要反转，IPS 屏（本设备使用）必须开启此选项
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(bsp_board->lcd_panel, true));
-
     // 可选配置（根据屏幕安装方向决定是否开启镜像/轴交换）:
-    // ESP_ERROR_CHECK(esp_lcd_panel_mirror(bsp_board->lcd_panel, true, false));
+    // 1. 交换 X/Y 轴 (对应之前的 swap_xy = true)
     // ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(bsp_board->lcd_panel, true));
+
+    // // 2. Y 轴镜像 (对应之前的 mirror_y = true)
+    // ESP_ERROR_CHECK(esp_lcd_panel_mirror(bsp_board->lcd_panel, false, true));
+
+    // 3. (可选) X 轴镜像 (如果需要)
+    // ESP_ERROR_CHECK(esp_lcd_panel_mirror(bsp_board->lcd_panel, true, false));
 
     // ── 步骤 9：关闭显示（等待上层主动调用 bsp_board_lcd_on() 开启）────────
     // 初始化完成但不立即显示，让上层决定何时打开（可以先准备好画面再开背光）
