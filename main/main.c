@@ -66,6 +66,7 @@ void app_main(void)
     {
         ESP_LOGI(TAG, "交互管理器初始化完成");
     }
+
     // LCD 初始化
     bsp_board_lcd_init(board);
     ui_init();
@@ -102,5 +103,5 @@ void app_main(void)
     //     tskNO_AFFINITY,
     //     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
-    ESP_LOGI(TAG, "舵机测试任务已启动，LCD 和舵机同时运行");
+    ESP_LOGI(TAG, "系统初始化完成，LCD 和舵机已启动");
 }

@@ -45,27 +45,27 @@
  * 1. 常量与配置宏
  * ═══════════════════════════════════════════════════════════════════ */
 
-#define REMINDER_MAX_ALARMS       8    ///< 最大闹钟数量
-#define REMINDER_MAX_TIMERS       4    ///< 最大倒计时数量
-#define REMINDER_MAX_CALENDARS    16   ///< 最大日历事件数量
-#define REMINDER_MSG_MAX_LEN      64   ///< 提醒消息最大长度（UTF-8 字节）
+#define REMINDER_MAX_ALARMS 8     ///< 最大闹钟数量，后续使用条件编译将多个变为？个
+#define REMINDER_MAX_TIMERS 4     /// todo<最大倒计时数量，后续使用条件编译将多倒计时变为单个，为什么会有倒计时？计算闹钟的吗？
+#define REMINDER_MAX_CALENDARS 16 ///< 最大日历事件数量
+#define REMINDER_MSG_MAX_LEN 64   ///< 提醒消息最大长度（UTF-8 字节）
 
 /* ── 闹钟响铃参数 ── */
-#define ALARM_RING_INTERVAL_MS    5000   ///< 闹钟响铃间隔（每 5 秒重复播报一次）
-#define ALARM_RING_MAX_COUNT      12     ///< 闹钟最大响铃次数（12次 × 5秒 = 60秒自动关闭）
-#define ALARM_RING_TIMEOUT_SEC    60     ///< 闹钟响铃超时（秒），超时自动关闭
+#define ALARM_RING_INTERVAL_MS 5000 ///< 闹钟响铃间隔（每 5 秒重复播报一次）
+#define ALARM_RING_MAX_COUNT 12     ///< 闹钟最大响铃次数（12次 × 5秒 = 60秒自动关闭）
+#define ALARM_RING_TIMEOUT_SEC 30   ///< 闹钟响铃超时（秒），超时自动关闭
 
 /* ── 天气拉取时间（宏定义，修改此处即可调整播报时段） ── */
-#define WEATHER_MORNING_HOUR      7    ///< 早间天气播报 — 小时（24h 制）
-#define WEATHER_MORNING_MINUTE    30   ///< 早间天气播报 — 分钟
-#define WEATHER_EVENING_HOUR      19   ///< 晚间天气播报 — 小时
-#define WEATHER_EVENING_MINUTE    0    ///< 晚间天气播报 — 分钟
-#define WEATHER_FETCH_TIMEOUT_MS  10000 ///< 天气 HTTP 请求超时（毫秒）
+#define WEATHER_MORNING_HOUR 7         ///< 早间天气播报 — 小时（24h 制）
+#define WEATHER_MORNING_MINUTE 30      ///< 早间天气播报 — 分钟
+#define WEATHER_EVENING_HOUR 19        ///< 晚间天气播报 — 小时
+#define WEATHER_EVENING_MINUTE 0       ///< 晚间天气播报 — 分钟
+#define WEATHER_FETCH_TIMEOUT_MS 10000 ///< 天气 HTTP 请求超时（毫秒）
 
 /* ── 天气 API 配置（后续填入真实地址和密钥即可） ── */
-#define WEATHER_API_URL_FMT  "https://devapi.qweather.com/v7/weather/now?location=%s&key=%s"
-#define WEATHER_API_KEY      "YOUR_API_KEY_HERE"     ///< 和风天气 API Key（待填入）
-#define WEATHER_DEFAULT_CITY "101210101"              ///< 默认城市代码（杭州=101210101）
+#define WEATHER_API_URL_FMT "https://devapi.qweather.com/v7/weather/now?location=%s&key=%s"
+#define WEATHER_API_KEY "YOUR_API_KEY_HERE" ///< 和风天气 API Key（待填入）
+#define WEATHER_DEFAULT_CITY "101210101"    ///< 默认城市代码（杭州=101210101）
 
 /* ═══════════════════════════════════════════════════════════════════
  * 2. 枚举定义
@@ -74,41 +74,45 @@
 /**
  * @brief 提醒类型枚举（同时作为优先级，值越小优先级越高）
  */
-typedef enum {
-    REMINDER_TYPE_ALARM    = 0,  ///< 闹钟（最高优先级，可打断一切）
-    REMINDER_TYPE_TIMER    = 1,  ///< 倒计时到期
-    REMINDER_TYPE_CALENDAR = 2,  ///< 日历事件
-    REMINDER_TYPE_WEATHER  = 3,  ///< 天气播报（最低优先级）
+typedef enum
+{
+    REMINDER_TYPE_ALARM = 0,    ///< 闹钟（最高优先级，可打断一切）
+    REMINDER_TYPE_TIMER = 1,    ///< 倒计时到期
+    REMINDER_TYPE_CALENDAR = 2, ///< 日历事件
+    REMINDER_TYPE_WEATHER = 3,  ///< 天气播报（最低优先级）
 } reminder_type_t;
 
 /**
  * @brief 闹钟重复模式
  */
-typedef enum {
-    ALARM_REPEAT_ONCE = 0,    ///< 仅响一次（响完自动禁用）
-    ALARM_REPEAT_DAILY,       ///< 每天重复
-    ALARM_REPEAT_WEEKDAY,     ///< 工作日重复（周一~周五）
-    ALARM_REPEAT_WEEKEND,     ///< 周末重复（周六~周日）
-    ALARM_REPEAT_CUSTOM,      ///< 自定义（按 weekday_mask 位图）
+typedef enum
+{
+    ALARM_REPEAT_ONCE = 0, ///< 仅响一次（响完自动禁用）
+    ALARM_REPEAT_DAILY,    ///< 每天重复
+    ALARM_REPEAT_WEEKDAY,  ///< 工作日重复（周一~周五）
+    ALARM_REPEAT_WEEKEND,  ///< 周末重复（周六~周日）
+    ALARM_REPEAT_CUSTOM,   ///< 自定义（按 weekday_mask 位图）
 } alarm_repeat_t;
 
 /**
  * @brief 提醒系统当前状态
  */
-typedef enum {
-    REMINDER_STATE_IDLE = 0,    ///< 空闲（正常显示时间）
-    REMINDER_STATE_RINGING,     ///< 闹钟响铃中（等待用户语音关闭或超时）
-    REMINDER_STATE_NOTIFYING,   ///< 正在播报提醒（倒计时/日历/天气，播完自动回 IDLE）
+typedef enum
+{
+    REMINDER_STATE_IDLE = 0,  ///< 空闲（正常显示时间）
+    REMINDER_STATE_RINGING,   ///< 闹钟响铃中（等待用户语音关闭或超时）
+    REMINDER_STATE_NOTIFYING, ///< 正在播报提醒（倒计时/日历/天气，播完自动回 IDLE）
 } reminder_state_t;
 
 /**
  * @brief 天气播报时段配置
  */
-typedef enum {
-    WEATHER_SCHEDULE_MORNING = 0,  ///< 仅早间播报
-    WEATHER_SCHEDULE_EVENING,      ///< 仅晚间播报
-    WEATHER_SCHEDULE_BOTH,         ///< 早晚各一次
-    WEATHER_SCHEDULE_DISABLED,     ///< 关闭天气播报
+typedef enum
+{
+    WEATHER_SCHEDULE_MORNING = 0, ///< 仅早间播报
+    WEATHER_SCHEDULE_EVENING,     ///< 仅晚间播报
+    WEATHER_SCHEDULE_BOTH,        ///< 早晚各一次
+    WEATHER_SCHEDULE_DISABLED,    ///< 关闭天气播报
 } weather_schedule_t;
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -120,25 +124,27 @@ typedef enum {
  *
  * NVS 存储 key: "alarm_0" ~ "alarm_7"
  */
-typedef struct {
-    uint8_t  id;                              ///< 闹钟 ID（0 ~ REMINDER_MAX_ALARMS-1）
-    bool     enabled;                         ///< 是否启用
-    uint8_t  hour;                            ///< 小时（0~23）
-    uint8_t  minute;                          ///< 分钟（0~59）
-    alarm_repeat_t repeat;                    ///< 重复模式
-    uint8_t  weekday_mask;                    ///< 自定义重复的星期位图（bit0=周日, bit1=周一...）
-    char     message[REMINDER_MSG_MAX_LEN];   ///< 语音提醒内容（如"该起床了"）
+typedef struct
+{
+    uint8_t id;                         ///< 闹钟 ID（0 ~ REMINDER_MAX_ALARMS-1）
+    bool enabled;                       ///< 是否启用
+    uint8_t hour;                       ///< 小时（0~23）
+    uint8_t minute;                     ///< 分钟（0~59）
+    alarm_repeat_t repeat;              ///< 重复模式
+    uint8_t weekday_mask;               ///< 自定义重复的星期位图（bit0=周日, bit1=周一...）
+    char message[REMINDER_MSG_MAX_LEN]; ///< 语音提醒内容（如"该起床了"）
 } alarm_entry_t;
 
 /**
  * @brief 倒计时条目（一次性，到期后自动清除）
  */
-typedef struct {
-    uint8_t  id;                              ///< 倒计时 ID（0 ~ REMINDER_MAX_TIMERS-1）
-    bool     active;                          ///< 是否正在计时
-    uint32_t duration_sec;                    ///< 总时长（秒）
-    int64_t  start_time_us;                   ///< 开始时刻（esp_timer_get_time 微秒）
-    char     message[REMINDER_MSG_MAX_LEN];   ///< 到期提醒内容（如"水烧好了"）
+typedef struct
+{
+    uint8_t id;                         ///< 倒计时 ID（0 ~ REMINDER_MAX_TIMERS-1）
+    bool active;                        ///< 是否正在计时
+    uint32_t duration_sec;              ///< 总时长（秒）
+    int64_t start_time_us;              ///< 开始时刻（esp_timer_get_time 微秒）
+    char message[REMINDER_MSG_MAX_LEN]; ///< 到期提醒内容（如"水烧好了"）
 } timer_entry_t;
 
 /**
@@ -146,24 +152,26 @@ typedef struct {
  *
  * NVS 存储 key: "cal_00" ~ "cal_15"
  */
-typedef struct {
-    uint8_t  id;                              ///< 事件 ID
-    bool     enabled;                         ///< 是否启用
-    uint16_t year;                            ///< 年份（如 2026）
-    uint8_t  month;                           ///< 月份（1~12）
-    uint8_t  day;                             ///< 日期（1~31）
-    uint8_t  hour;                            ///< 小时（0~23）
-    uint8_t  minute;                          ///< 分钟（0~59）
-    char     message[REMINDER_MSG_MAX_LEN];   ///< 事件描述（如"下午3点开会"）
+typedef struct
+{
+    uint8_t id;                         ///< 事件 ID
+    bool enabled;                       ///< 是否启用
+    uint16_t year;                      ///< 年份（如 2026）
+    uint8_t month;                      ///< 月份（1~12）
+    uint8_t day;                        ///< 日期（1~31）
+    uint8_t hour;                       ///< 小时（0~23）
+    uint8_t minute;                     ///< 分钟（0~59）
+    char message[REMINDER_MSG_MAX_LEN]; ///< 事件描述（如"下午3点开会"）
 } calendar_entry_t;
 
 /**
  * @brief 天气配置
  */
-typedef struct {
-    weather_schedule_t schedule;              ///< 播报时段
-    char     city_code[16];                   ///< 城市代码（和风天气格式，如"101210101"=杭州）
-    char     city_name[32];                   ///< 城市显示名称（用于语音播报，如"杭州"）
+typedef struct
+{
+    weather_schedule_t schedule; ///< 播报时段
+    char city_code[16];          ///< 城市代码（和风天气格式，如"101210101"=杭州）
+    char city_name[32];          ///< 城市显示名称（用于语音播报，如"杭州"）
 } weather_config_t;
 
 /**

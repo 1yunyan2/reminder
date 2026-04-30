@@ -414,7 +414,7 @@ static void interaction_play_blocking(robot_emotion_t target_emotion)
     //   ui_play_animation(cmd->screen_anim) → LVGL 任务收到后播放对应动画
     // 目前 UI 动画未完成，用随机情绪文字临时占位
     static const char *s_face_labels[] = {"开心", "好奇", "傲娇", "怕痒", "委屈", "犯困"};
-    const char *rand_label = s_face_labels[esp_random() % 6];
+    const char *rand_label = s_face_labels[esp_random() % 6]; // 随机选择一个
     ESP_LOGI(TAG, "📺 屏幕显示: %s  （动画槽: %s）", rand_label, cmd->screen_anim);
     // TODO: ui_play_animation(cmd->screen_anim);
 
@@ -437,15 +437,15 @@ static void interaction_play_blocking(robot_emotion_t target_emotion)
     {
         // 前半段：三轴同时运动到 angle_1（未参与的轴保持 90°）
         bsp_servo_move_all_parallel(
-            (loop < cmd->head.count)      ? cmd->head.angle_1      : 90.0f,
-            (loop < cmd->left_arm.count)  ? cmd->left_arm.angle_1  : 90.0f,
+            (loop < cmd->head.count) ? cmd->head.angle_1 : 90.0f,
+            (loop < cmd->left_arm.count) ? cmd->left_arm.angle_1 : 90.0f,
             (loop < cmd->right_arm.count) ? cmd->right_arm.angle_1 : 90.0f,
             cmd->head.speed);
 
         // 后半段：三轴同时运动到 angle_2
         bsp_servo_move_all_parallel(
-            (loop < cmd->head.count)      ? cmd->head.angle_2      : 90.0f,
-            (loop < cmd->left_arm.count)  ? cmd->left_arm.angle_2  : 90.0f,
+            (loop < cmd->head.count) ? cmd->head.angle_2 : 90.0f,
+            (loop < cmd->left_arm.count) ? cmd->left_arm.angle_2 : 90.0f,
             (loop < cmd->right_arm.count) ? cmd->right_arm.angle_2 : 90.0f,
             cmd->head.speed);
     }

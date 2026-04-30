@@ -8,7 +8,5 @@ idf_component_register(SRCS
 "bsp/bsp_servo.c"
 "bsp/servo_manager.c"
 "ui/ui_port.c"
-"ui/gif_eye.c"
-"ui/gif_eye2.c"
 "ui/picture.c"
 INCLUDE_DIRS ".")
