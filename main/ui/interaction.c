@@ -19,7 +19,10 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include "driver/i2s_std.h"
 #include "esp_heap_caps.h"
+#include "bsp/bsp_board.h"
+#include "ui/ui_port.h"
 
 static const char *TAG = "INTERACTION";
 
@@ -316,6 +319,51 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     }};
 
 // ==========================================
+// 3a. 方波 beep（I2S 占位音效，真实音频接入后删除）
+// ==========================================
+
+// 880Hz 方波，半周期采样数（16kHz 采样率：16000/880/2 ≈ 9）
+#define BEEP_HALF 9
+#define BEEP_FULL (BEEP_HALF * 2)
+
+/**
+ * @brief 通过 I2S TX 输出 300ms 880Hz 方波（立体声 16-bit PCM，16kHz）
+ */
+static void play_square_wave_beep(void)
+{
+    bsp_board_t *board = bsp_board_get_instance();
+    if (board == NULL || board->i2s_tx_handle == NULL)
+        return;
+
+    static const int16_t AMP = 0x1800; // ~37.5% 满幅
+    int16_t one_period[BEEP_FULL * 2]; // 一个完整周期，L+R 各 int16_t
+    for (int i = 0; i < BEEP_FULL; i++)
+    {
+        int16_t v = (i < BEEP_HALF) ? AMP : -AMP;
+        one_period[i * 2] = v;
+        one_period[i * 2 + 1] = v;
+    }
+
+    // 300ms × 16000 frames/s = 4800 frames
+    int total_frames = 16000 * 300 / 1000;
+    size_t bytes_written;
+    int sent = 0;
+    while (sent < total_frames)
+    {
+        int chunk = BEEP_FULL;
+        if (sent + chunk > total_frames)
+            chunk = total_frames - sent;
+        i2s_channel_write(board->i2s_tx_handle,
+                          one_period,
+                          chunk * 2 * sizeof(int16_t),
+                          &bytes_written,
+                          pdMS_TO_TICKS(200));
+        sent += chunk;
+    }
+    ESP_LOGI(TAG, "🔊 方波 beep 播放完毕");
+}
+
+// ==========================================
 // 3. 震动马达控制（私有）
 //    使用 BSP_MOTOR_VIB_PIN 宏，不硬编码 GPIO 号
 // ==========================================
@@ -409,18 +457,14 @@ static void interaction_play_blocking(robot_emotion_t target_emotion)
 
     ESP_LOGI(TAG, ">>> 开始执行情绪动画: %d (%s) <<<", (int)target_emotion, cmd->screen_anim);
 
-    // ── 2. 屏幕情绪显示（随机从6个固定标签中选一个，后续替换为真实动画）──────
-    // 架构说明：cmd->screen_anim 是动画标识符，最终传给 UI 层：
-    //   ui_play_animation(cmd->screen_anim) → LVGL 任务收到后播放对应动画
-    // 目前 UI 动画未完成，用随机情绪文字临时占位
-    static const char *s_face_labels[] = {"开心", "好奇", "傲娇", "怕痒", "委屈", "犯困"};
-    const char *rand_label = s_face_labels[esp_random() % 6]; // 随机选择一个
-    ESP_LOGI(TAG, "📺 屏幕显示: %s  （动画槽: %s）", rand_label, cmd->screen_anim);
-    // TODO: ui_play_animation(cmd->screen_anim);
+    // ── 2. 屏幕动画 ──────────────────────────────────────────────────────────
+    ui_play_animation(cmd->screen_anim);
+    ESP_LOGI(TAG, "📺 屏幕动画: %s", cmd->screen_anim);
 
-    // ── 3. 音频播放（预留）──────────────────────────────────────────────────
+    // ── 3. 音频播放（方波占位，真实文件接入后替换）──────────────────────────
     // TODO: audio_player_play_file(cmd->audio_file);
-    ESP_LOGI(TAG, "🔊 音效槽: %s", cmd->audio_file);
+    ESP_LOGI(TAG, "🔊 音效槽: %s（当前使用方波占位）", cmd->audio_file);
+    play_square_wave_beep(); // 播放方波占位音频
 
     // ── 4. 震动马达 ──────────────────────────────────────────────────────────
     trigger_vibration_motor(cmd->motor_mode);

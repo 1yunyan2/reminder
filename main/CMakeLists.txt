@@ -9,4 +9,5 @@ idf_component_register(SRCS
 "bsp/servo_manager.c"
 "ui/ui_port.c"
 "ui/picture.c"
+"ui/font_cn_16.c"
 INCLUDE_DIRS ".")

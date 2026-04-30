@@ -52,7 +52,7 @@
 
 /* ── 闹钟响铃参数 ── */
 #define ALARM_RING_INTERVAL_MS 5000 ///< 闹钟响铃间隔（每 5 秒重复播报一次）
-#define ALARM_RING_MAX_COUNT 12     ///< 闹钟最大响铃次数（12次 × 5秒 = 60秒自动关闭）
+#define ALARM_RING_MAX_COUNT 6      ///< 闹钟最大响铃次数（12次 × 5秒 = 60秒自动关闭）
 #define ALARM_RING_TIMEOUT_SEC 30   ///< 闹钟响铃超时（秒），超时自动关闭
 
 /* ── 天气拉取时间（宏定义，修改此处即可调整播报时段） ── */
@@ -268,13 +268,6 @@ void reminder_alarm_get_all(alarm_entry_t *out_list, uint8_t *out_count);
  * @return ESP_OK=成功关闭 / ESP_ERR_NOT_FOUND=当前无响铃闹钟
  */
 esp_err_t reminder_alarm_dismiss(void);
-
-/**
- * @brief 贪睡（稍后再响）— 延迟指定分钟后再次触发
- * @param snooze_minutes 贪睡时长（分钟），默认传 5
- * @return ESP_OK / ESP_ERR_NOT_FOUND
- */
-esp_err_t reminder_alarm_snooze(uint8_t snooze_minutes);
 
 /* ═══════════════════════════════════════════════════════════════════
  * 6. 对外接口 — 倒计时操作

@@ -3,6 +3,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "nvs_flash.h"
 #include "ui/ui_port.h"
 #include "ui/interaction.h"
 #include "ui/reminder.h"
@@ -38,6 +39,17 @@ void app_main(void)
 {
     // 等待 USB-JTAG CDC 连接建立，避免打印阻塞导致看门狗触发
     vTaskDelay(pdMS_TO_TICKS(500));
+
+    // NVS 初始化（reminder 的闹钟持久化依赖它）
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+
+    // 提醒系统初始化（含 MOCK_TIME 模式下的系统时间设置）
+    reminder_init(NULL); // NULL = 暂无 TTS 回调，后续接入 session 层时替换
 
     bsp_board_t *board = bsp_board_get_instance();
 
