@@ -251,6 +251,7 @@ esp_err_t reminder_alarm_delete(uint8_t alarm_id);
  * @brief 启用/禁用闹钟
  */
 esp_err_t reminder_alarm_set_enabled(uint8_t alarm_id, bool enabled);
+esp_err_t reminder_alarm_update(uint8_t alarm_id, const alarm_entry_t *entry);
 
 /**
  * @brief 获取所有闹钟

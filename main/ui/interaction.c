@@ -28,7 +28,7 @@ static const char *TAG = "INTERACTION";
 
 // ─── Worker task 配置 ────────────────────────────────────────────────────────
 #define INTERACTION_QUEUE_LEN 8     ///< 最多缓存 4 个待执行情绪（超出时丢弃新请求）
-#define INTERACTION_TASK_STACK 4096 ///< worker 栈大小（含 vTaskDelay 调用链）
+#define INTERACTION_TASK_STACK 8192 ///< worker 栈大小（含音频/舵机调用链）
 #define INTERACTION_TASK_PRIO 5     ///< 优先级与 session 相当，略低于音频（7）
 
 static QueueHandle_t s_ia_queue = NULL; ///< 情绪 ID 队列
@@ -457,11 +457,9 @@ static void interaction_play_blocking(robot_emotion_t target_emotion)
 
     ESP_LOGI(TAG, ">>> 开始执行情绪动画: %d (%s) <<<", (int)target_emotion, cmd->screen_anim);
 
-    // ── 2. 屏幕动画 ──────────────────────────────────────────────────────────
-    ui_play_animation(cmd->screen_anim);
-    ESP_LOGI(TAG, "📺 屏幕动画: %s", cmd->screen_anim);
-
     // ── 3. 音频播放（方波占位，真实文件接入后替换）──────────────────────────
+    // 注：lv_gif_set_src 会访问 SPIFFS（SPI flash），ia_worker 栈在 SPIRAM，
+    //     禁用 cache 时 SPIRAM 不可访问，因此不能在此任务中调用屏幕动画。
     // TODO: audio_player_play_file(cmd->audio_file);
     ESP_LOGI(TAG, "🔊 音效槽: %s（当前使用方波占位）", cmd->audio_file);
     play_square_wave_beep(); // 播放方波占位音频

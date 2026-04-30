@@ -225,3 +225,10 @@ void bsp_motor_pulse(void);
  * @note 由 touch_scan_task() 内部自动调用
  */
 void bsp_touch_init(void);
+
+/**
+ * @brief 扫描触摸控制器（内部调用，无需手动执行）
+ * @note 由 touch_scan_task() 循环调用
+ * @note 扫描结果将写入 bsp_touch_get_event() 的输出参数
+ */
+void bsp_motor_pulse(void);

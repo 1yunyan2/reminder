@@ -89,7 +89,7 @@ void app_main(void)
     BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
         touch_scan_task,
         "touch_scan",
-        4096,
+        8192,
         NULL,
         4, // 优先级略低于舵机和音频
         NULL,

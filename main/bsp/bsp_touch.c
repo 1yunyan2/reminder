@@ -1,3 +1,10 @@
+/**
+ * @file bsp_touch.c
+ * @brief 触摸按键板级支持包
+ * 功能含义：实现电容触摸按键的扫描、消抖、组合按键检测以及事件分发，
+ *          支持头部、腹部、背部三个身体触摸点和前后翻页键，
+ *          根据当前UI视图动态调整按键行为和长按阈值。
+ */
 
 #include "bsp/bsp_board.h"
 #include "freertos/FreeRTOS.h"
@@ -6,230 +13,287 @@
 #include "driver/touch_pad.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
-#include "esp_random.h"
 #include "bsp/bsp_config.h"
 #include "ui/interaction.h"
-#include "ui/ui_port.h"
+#include "ui/ui_port.h" /* ← 新增：ui_get_current_view / ui_dispatch_touch_event */
+
+// 日志标签，用于ESP_LOG输出
 static const char *TAG = "BSP_TOUCH";
+
+// 触摸事件队列长度
+#define TOUCH_EVENT_QUEUE_LEN 8
+// 触摸事件队列句柄
+static QueueHandle_t s_touch_event_queue = NULL;
+
+// 触摸触发阈值百分比（相对于基线的变化率）
+#define TOUCH_THRESH_PERCENT 0.05f
+// 上电屏蔽时间（毫秒），上电后2秒内不检测触摸，避免上电干扰
+#define POWER_ON_MASK_TIME 2000
+// 触摸最小绝对变化量（原始值），低于此值认为是噪声
+#define TOUCH_MIN_DELTA 2000
+// 身体按键（头/腹/背）有效按压最小持续时间（毫秒）
+#define BODY_PRESS_MIN_MS 300
+// 翻页键短按最小持续时间（毫秒）
+#define PAGE_SHORT_PRESS_MIN_MS 100
+// 翻页键长按阈值时间（毫秒）
+#define PAGE_LONG_PRESS_MS 3000
+// 按下消抖计数（需要连续检测到多少次按下才算真按下）
+#define PRESS_DEBOUNCE 2
+// 释放消抖计数（需要连续检测到多少次释放才算真释放）
+#define RELEASE_DEBOUNCE 4
+
 /**
- * !后续将多任务变为单任务，不需要这么多情绪，一次就显示一个情绪对应的数据，
- * 都用条件编译变为单个，动画过程触发需要可以直接打断然后切换动画和声音
- *
- * !
- * !
- * !
- * !!
- * !!
- * !
- * !
- * !!
- * !
- * !!
- * !
- *
+ * @brief 触摸按键状态结构体
+ * 用于记录单个触摸按键的完整状态
  */
-// ── 情绪显示分组表（每个触摸位置对应 6 个随机情绪）────────────────────────────
 typedef struct
 {
-    const char *name;  // 情绪名称
-    const char *anim;  // 屏幕动画描述（后续替换为真实动画）
-    const char *audio; // 音效描述（后续替换为真实音频）
-} emo_entry_t;
-
-static const emo_entry_t g_emo_head[] = {
-    {"开心", "眯眼笑+冒星星", "短促笑声"},
-    {"好奇", "歪头眨眼+问号", "嗯？+轻微按键音"},
-    {"傲娇", "挑眉+叉腰脸", "哼~+轻敲桌面声"},
-    {"怕痒", "眯眼笑+躲躲闪闪", "咯咯笑+好痒好痒"},
-    {"犯困", "打哈欠+眼皮下垂", "打哈欠+轻柔呼吸音"},
-    {"委屈", "撇嘴+泪眼", "小声啜泣+呜~"},
-};
-static const emo_entry_t g_emo_abdomen[] = {
-    {"舒服", "闭眼打哈欠+波浪线", "满足嗯~+舒缓呼吸"},
-    {"撒娇", "泪眼汪汪+歪头", "要抱抱~+蹭蹭摩擦"},
-    {"生气", "鼓脸+冒火", "哼！+跺脚声"},
-    {"害羞", "捂脸+脸红", "哎呀~+害羞轻笑"},
-    {"惊喜", "眼睛瞪大+闪光", "哇！+铃铛脆响"},
-    {"慵懒", "半睁眼+打哈欠", "慵懒哈欠+咿呀声"},
-};
-static const emo_entry_t g_emo_back[] = {
-    {"治愈", "眯眼+爱心", "呼噜呼噜+轻拍声"},
-    {"傲娇", "鼻孔看人+叉腰", "切~+轻哼声"},
-    {"委屈", "撇嘴+低头", "小声抽泣+呜~"},
-    {"兴奋", "爱心眼+蹦跳", "耶~+拍手声"},
-    {"好奇", "歪头眨眼+问号", "咦？+轻微摩擦声"},
-    {"怕痒", "笑出眼泪+扭动", "咯咯大笑+别挠啦~"},
-};
-static const emo_entry_t g_emo_head_abdomen[] = {
-    {"兴奋", "爱心眼+蹦跳", "哇呜~+铃铛串响"},
-    {"害羞蹭蹭", "脸红+蹭脸", "嘿嘿~+蹭蹭摩擦"},
-    {"舒服到打滚", "眯眼+波浪线", "呼噜~+翻身轻响"},
-    {"傲娇求摸", "挑眉+歪头", "哼快摸我~+轻敲"},
-    {"犯困", "打哈欠+眼皮下垂", "打哈欠+轻柔呼吸"},
-    {"惊喜", "眼睛瞪大+闪光", "哇！+烟花脆响"},
-};
-static const emo_entry_t g_emo_head_back[] = {
-    {"治愈", "眯眼+爱心", "呼噜呼噜+轻拍声"},
-    {"傲娇", "鼻孔看人+叉腰", "切~+轻哼声"},
-    {"委屈", "撇嘴+低头", "小声抽泣+呜~"},
-    {"兴奋", "爱心眼+蹦跳", "耶~+拍手声"},
-    {"好奇", "歪头眨眼+问号", "咦？+轻微摩擦声"},
-    {"怕痒", "笑出眼泪+扭动", "咯咯大笑+别挠啦~"},
-};
-static const emo_entry_t g_emo_abdomen_back[] = {
-    {"慵懒瘫坐", "半睁眼+打哈欠", "慵懒哈欠+瘫坐咚声"},
-    {"惊喜抱抱", "爱心眼+张开双臂", "要抱抱~+哗啦声"},
-    {"怕痒到扭动", "笑出眼泪+扭动", "大笑+救命啊~"},
-    {"舒服", "闭眼打哈欠+波浪", "满足嗯~+舒缓呼吸"},
-    {"生气", "鼓脸+冒火", "哼！+跺脚声"},
-    {"兴奋", "爱心眼+蹦跳", "哇呜~+铃铛串响"},
-};
-
-// 从分组中随机取一个情绪，显示到屏幕并打印日志
-static void show_random_emotion(const emo_entry_t *group, size_t count)
-{
-    const emo_entry_t *e = &group[esp_random() % count];
-    ui_show_emotion(e->name, e->anim, e->audio);
-    ESP_LOGI("TOUCH", "[%s] 动画:%s 音效:%s", e->name, e->anim, e->audio);
-}
-#define SHOW_EMO(group) show_random_emotion(group, sizeof(group) / sizeof(group[0]))
-
-#define TOUCH_EVENT_QUEUE_LEN 8                  // todo  触摸事件队列长度，改为1
-static QueueHandle_t s_touch_event_queue = NULL; // 触摸事件队列句柄
-
-#define TOUCH_THRESH_PERCENT 0.05f // 15%相对阈值（提高防串扰）相对于基线变化增加度
-#define POWER_ON_MASK_TIME 2000    // 上电屏蔽2秒
-#define TOUCH_MIN_DELTA 2000       // 绝对变化量阈值（提高防串扰，需实际测量调整），裸触摸为5W，隔着外壳为2000
-#define SHORT_PRESS_MIN_MS 300     // 短按最短持续时间（头/腹/背 与翻页短按 共用）
-#define PAGE_LONG_PRESS_MS 3000    // 翻页键长按阈值（进入功能菜单）
-#define PRESS_DEBOUNCE 2           // 连续 2 次读到按下才视为真正按下，防止瞬时尖峰误触
-#define RELEASE_DEBOUNCE 4         // 连续 4 次读到未按才认为真正释放，防止按住时抖动误触发
-
-typedef struct
-{
-    touch_pad_t channel;     // 触摸通道（对应 GPIO）
-    uint32_t baseline;       // 基线值（初始化时测量，后续动态调整可选）
-    bool is_pressed;         // 已通过按下防抖、视为真正按下
-    uint32_t press_start_ms; // 按下时间，用于短/长按计时
-    uint8_t press_count;     // 连续按下次数，达到 PRESS_DEBOUNCE 才认按下
-    uint8_t release_count;   // 连续未按次数，达到 RELEASE_DEBOUNCE 才真正释放
+    touch_pad_t channel;     // 参数含义：触摸通道号（ESP32触摸引脚编号）
+    uint32_t baseline;       // 参数含义：触摸基线值（无触摸时的原始读数）
+    bool is_pressed;         // 参数含义：当前是否处于按下状态
+    uint32_t press_start_ms; // 参数含义：按下开始的时间戳（毫秒）
+    uint8_t press_count;     // 参数含义：按下消抖计数器
+    uint8_t release_count;   // 参数含义：释放消抖计数器
 } touch_btn_t;
 
-static touch_btn_t btn_head = {.channel = BSP_TOUCH_1_PIN};         // 头部
-static touch_btn_t btn_abdomen = {.channel = BSP_TOUCH_3_PIN};      // 腹部
-static touch_btn_t btn_back = {.channel = BSP_TOUCH_2_PIN};         // 背部
-static touch_btn_t btn_prev_page = {.channel = BSP_TOUCH_PREV_PIN}; // 前一页
-static touch_btn_t btn_next_page = {.channel = BSP_TOUCH_NEXT_PIN}; // 后一页
+// 头部触摸按键实例
+static touch_btn_t btn_head = {.channel = BSP_TOUCH_1_PIN};
+// 腹部触摸按键实例
+static touch_btn_t btn_abdomen = {.channel = BSP_TOUCH_3_PIN};
+// 背部触摸按键实例
+static touch_btn_t btn_back = {.channel = BSP_TOUCH_2_PIN};
+// 前页触摸按键实例
+static touch_btn_t btn_prev_page = {.channel = BSP_TOUCH_PREV_PIN};
+// 后页触摸按键实例
+static touch_btn_t btn_next_page = {.channel = BSP_TOUCH_NEXT_PIN};
 
-// 组合触摸激活状态（防止持续按住时重复触发）
+// 组合按键激活标志及消抖计数（需连续 PRESS_DEBOUNCE 次才触发）
 static bool s_combo_ha_active = false;
+static uint8_t s_combo_ha_cnt = 0;
 static bool s_combo_hb_active = false;
+static uint8_t s_combo_hb_cnt = 0;
 static bool s_combo_ab_active = false;
+static uint8_t s_combo_ab_cnt = 0;
 
-// 翻页键互斥占用：两键同时触摸时只保留先感应到的那一个
+/**
+ * @brief 翻页键占用者枚举
+ * 用于实现翻页键互斥逻辑，防止前后页同时按下产生冲突
+ */
 typedef enum
 {
-    PAGE_OWNER_NONE = 0,
-    PAGE_OWNER_PREV,
-    PAGE_OWNER_NEXT
+    PAGE_OWNER_NONE = 0, // 无人占用
+    PAGE_OWNER_PREV,     // 前页键占用
+    PAGE_OWNER_NEXT      // 后页键占用
 } page_owner_t;
+
+// 当前翻页键占用者
 static page_owner_t s_page_owner = PAGE_OWNER_NONE;
 
-static void send_touch_event(touch_event_t event) // 往事件队列发送触摸事件
+/**
+ * @brief 发送触摸事件到队列
+ * 函数含义：将检测到的触摸事件发送到事件队列，供后续处理
+ * @param event 参数含义：要发送的触摸事件类型
+ */
+static void send_touch_event(touch_event_t event)
 {
+    // API含义：FreeRTOS队列发送函数，将数据发送到队列
+    // API参数含义：
+    //   s_touch_event_queue：队列句柄
+    //   &event：要发送的数据指针
+    //   0：阻塞时间（0表示不阻塞，立即返回）
     xQueueSend(s_touch_event_queue, &event, 0);
 }
 
-void bsp_motor_pulse(void) // 震动马达单次脉冲
+/**
+ * @brief 马达震动脉冲
+ * 函数含义：控制震动马达产生一个30毫秒的震动脉冲，用于触觉反馈
+ */
+void bsp_motor_pulse(void)
 {
-    gpio_set_level(BSP_MOTOR_VIB_PIN, 1); // 震动马达接在 GPIO 上，输出高电平时震动
+    // API含义：设置GPIO引脚电平
+    // API参数含义：
+    //   BSP_MOTOR_VIB_PIN：GPIO引脚号
+    //   1：输出高电平（马达启动）
+    gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
+
+    // API含义：FreeRTOS任务延时，单位为系统时钟节拍
+    // API参数含义：pdMS_TO_TICKS(30)：将30毫秒转换为系统时钟节拍数
     vTaskDelay(pdMS_TO_TICKS(30));
+
+    // API含义：设置GPIO引脚电平
+    // API参数含义：
+    //   BSP_MOTOR_VIB_PIN：GPIO引脚号
+    //   0：输出低电平（马达停止）
     gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
 }
 
-static uint32_t touch_get_baseline(touch_pad_t ch) // 取多次平均，稳定基线值
+/**
+ * @brief 获取触摸基线值
+ * 函数含义：连续读取10次触摸原始数据并取平均值，作为触摸基线
+ * @param ch 参数含义：触摸通道号
+ * @return 返回值含义：计算得到的基线值
+ */
+static uint32_t touch_get_baseline(touch_pad_t ch)
 {
     uint32_t sum = 0;
     for (int i = 0; i < 10; i++)
     {
-        touch_pad_sw_start(); // 触发一次采样，更新内部状态
+        // API含义：启动软件控制的触摸传感器测量
+        touch_pad_sw_start();
+
+        // 延时10毫秒等待测量完成
         vTaskDelay(pdMS_TO_TICKS(10));
+
         uint32_t val;
-        touch_pad_read_raw_data(ch, &val); // 读原始值，包含基线和噪声
+        // API含义：读取触摸传感器原始数据
+        // API参数含义：
+        //   ch：触摸通道号
+        //   &val：输出参数，用于存储读取到的原始值
+        touch_pad_read_raw_data(ch, &val);
+
         sum += val;
     }
-    return sum / 10;
+    return sum / 10; // 返回10次测量的平均值
 }
 
+/**
+ * @brief 触摸初始化函数
+ * 函数含义：初始化触摸按键驱动、GPIO、事件队列，并获取各按键的初始基线
+ */
 void bsp_touch_init(void)
 {
+    // API含义：创建FreeRTOS队列
+    // API参数含义：
+    //   TOUCH_EVENT_QUEUE_LEN：队列长度
+    //   sizeof(touch_event_t)：每个元素的大小
+    // 返回值含义：队列句柄
     s_touch_event_queue = xQueueCreate(TOUCH_EVENT_QUEUE_LEN, sizeof(touch_event_t));
 
+    // GPIO配置结构体，用于震动马达
     gpio_config_t motor_conf = {
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = (1ULL << BSP_MOTOR_VIB_PIN),
+        .mode = GPIO_MODE_OUTPUT,                    // GPIO模式：输出
+        .pin_bit_mask = (1ULL << BSP_MOTOR_VIB_PIN), // 要配置的GPIO引脚位掩码
     };
+
+    // API含义：配置GPIO参数
+    // API参数含义：&motor_conf：GPIO配置结构体指针
     gpio_config(&motor_conf);
+
+    // API含义：设置GPIO引脚电平，初始化为低电平（马达停止）
     gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
 
-    touch_pad_init(); // 初始化触摸控制器
-    // 配置触摸参数：高电压 2.7V，低电压 0.5V，无衰减（根据实际情况调整）
+    // API含义：初始化触摸传感器驱动
+    touch_pad_init();
+
+    // API含义：设置触摸传感器充电/放电电压
+    // API参数含义：
+    //   TOUCH_HVOLT_2V7：高电压2.7V
+    //   TOUCH_LVOLT_0V5：低电压0.5V
+    //   TOUCH_HVOLT_ATTEN_0V：高电压衰减0V
     touch_pad_set_voltage(TOUCH_HVOLT_2V7, TOUCH_LVOLT_0V5, TOUCH_HVOLT_ATTEN_0V);
-    // 配置触摸按键：引脚、中断类型、中断优先级
+
+    // API含义：配置单个触摸通道
+    // API参数含义：btn_head.channel：要配置的触摸通道号
     touch_pad_config(btn_head.channel);
     touch_pad_config(btn_abdomen.channel);
     touch_pad_config(btn_back.channel);
     touch_pad_config(btn_prev_page.channel);
     touch_pad_config(btn_next_page.channel);
-    touch_pad_set_fsm_mode(TOUCH_FSM_MODE_SW); // 由软件触发测量，灵活控制测量时机
-    touch_pad_filter_disable();                // 关闭滤波器，减少测量延迟（根据实际情况调整）
 
+    // API含义：设置触摸传感器工作模式为软件控制模式
+    // API参数含义：TOUCH_FSM_MODE_SW：软件控制模式
+    touch_pad_set_fsm_mode(TOUCH_FSM_MODE_SW);
+
+    // API含义：禁用触摸传感器硬件滤波
+    touch_pad_filter_disable();
+
+    // 延时100毫秒，等待传感器稳定
     vTaskDelay(pdMS_TO_TICKS(100));
 
+    // 获取各按键的基线值
     btn_head.baseline = touch_get_baseline(btn_head.channel);
     btn_abdomen.baseline = touch_get_baseline(btn_abdomen.channel);
     btn_back.baseline = touch_get_baseline(btn_back.channel);
     btn_prev_page.baseline = touch_get_baseline(btn_prev_page.channel);
     btn_next_page.baseline = touch_get_baseline(btn_next_page.channel);
 
-    ESP_LOGI(TAG, "✅ 触摸初始化完成");
+    // API含义：输出日志信息
+    // API参数含义：
+    //   TAG：日志标签
+    //   "触摸初始化完成"：日志内容
+    ESP_LOGI(TAG, "触摸初始化完成");
     ESP_LOGI(TAG, "基线: 头=%lu 腹=%lu 背=%lu 前页=%lu 后页=%lu",
              btn_head.baseline, btn_abdomen.baseline, btn_back.baseline,
              btn_prev_page.baseline, btn_next_page.baseline);
 }
 
-bool bsp_touch_get_event(touch_event_t *out_event) // 获取触摸事件
+/**
+ * @brief 获取触摸事件
+ * 函数含义：从事件队列中获取一个触摸事件（非阻塞）
+ * @param out_event 参数含义：输出参数，用于存储获取到的事件
+ * @return 返回值含义：true=成功获取到事件，false=队列无事件
+ */
+bool bsp_touch_get_event(touch_event_t *out_event)
 {
+    // API含义：从FreeRTOS队列接收数据
+    // API参数含义：
+    //   s_touch_event_queue：队列句柄
+    //   out_event：接收数据的缓冲区指针
+    //   0：阻塞时间（0表示不阻塞）
+    // 返回值含义：pdTRUE=成功接收，pdFALSE=失败
     return xQueueReceive(s_touch_event_queue, out_event, 0) == pdTRUE;
 }
 
-static int32_t read_btn_delta(touch_btn_t *btn) // 读取当前值与基线的差值，正数表示按下，负数表示未按下
+/**
+ * @brief 读取按键变化量
+ * 函数含义：读取触摸按键当前值与基线的差值
+ * @param btn 参数含义：按键结构体指针
+ * @return 返回值含义：当前值与基线的差值（可能为正或负）
+ */
+static int32_t read_btn_delta(touch_btn_t *btn)
 {
     uint32_t val;
-    touch_pad_read_raw_data(btn->channel, &val); // 读原始值，包含基线和噪声
+    // API含义：读取触摸传感器原始数据
+    touch_pad_read_raw_data(btn->channel, &val);
+
+    // 返回当前值与基线的差值
     return (int32_t)(val - btn->baseline);
 }
 
-static bool read_btn_pressed(touch_btn_t *btn) // 判断按钮是否被按下，基于绝对阈值和相对阈值双重判定，提高抗干扰能力
+/**
+ * @brief 判断按键是否按下
+ * 函数含义：根据变化量判断按键是否被按下
+ * @param btn 参数含义：按键结构体指针
+ * @return 返回值含义：true=按下，false=未按下
+ */
+static bool read_btn_pressed(touch_btn_t *btn)
 {
-    int32_t delta = read_btn_delta(btn); // 正数表示按下，负数表示未按下
+    int32_t delta = read_btn_delta(btn);
+
+    // 判断条件：
+    // 1. 绝对变化量 > TOUCH_MIN_DELTA
+    // 2. 相对变化量 > 基线的 TOUCH_THRESH_PERCENT (5%)
     return (delta > TOUCH_MIN_DELTA) &&
            (delta > (int32_t)(btn->baseline * TOUCH_THRESH_PERCENT));
 }
 
 /**
- * @brief 单体（头/腹/背）按钮：仅短按，按下需达 SHORT_PRESS_MIN_MS，释放时才触发。
- *
- * 触发时机：以"抬起"为结束时间——按住期间不触发，释放后通过 RELEASE_DEBOUNCE
- * 防抖再判定持续时长是否达到短按阈值。参与组合（in_combo）的按键不发独立事件。
+ * @brief 更新身体按键状态
+ * 函数含义：处理头部/腹部/背部等身体触摸按键的状态机、消抖和事件发送
+ * @param btn        参数含义：按键结构体指针
+ * @param pressed    参数含义：当前是否检测到按下（原始状态）
+ * @param in_combo   参数含义：是否处于组合按键状态（若是则忽略单键）
+ * @param now_ms     参数含义：当前时间戳（毫秒）
+ * @param name       参数含义：按键名称（用于日志）
+ * @param short_evt  参数含义：短按事件类型
  */
 static void update_body_btn(touch_btn_t *btn, bool pressed, bool in_combo,
                             uint32_t now_ms, const char *name,
                             touch_event_t short_evt)
 {
+    // 如果处于组合按键状态，重置单键状态并返回
     if (in_combo)
     {
-        // 参与组合：清空状态，避免组合释放后误判为短按
         btn->is_pressed = false;
         btn->press_count = 0;
         btn->release_count = 0;
@@ -237,33 +301,39 @@ static void update_body_btn(touch_btn_t *btn, bool pressed, bool in_combo,
         return;
     }
 
+    // 检测到按下
     if (pressed)
     {
-        btn->release_count = 0;
+        btn->release_count = 0; // 清零释放计数器
         if (!btn->is_pressed)
         {
-            btn->press_count++;
+            btn->press_count++; // 按下计数器加1
+            // 连续检测到PRESS_DEBOUNCE次按下，确认是真按下
             if (btn->press_count >= PRESS_DEBOUNCE)
             {
                 btn->is_pressed = true;
-                btn->press_start_ms = now_ms;
+                btn->press_start_ms = now_ms; // 记录按下开始时间
             }
         }
     }
+    // 检测到释放
     else
     {
-        btn->press_count = 0;
+        btn->press_count = 0; // 清零按下计数器
         if (btn->is_pressed)
         {
-            btn->release_count++;
+            btn->release_count++; // 释放计数器加1
+            // 连续检测到RELEASE_DEBOUNCE次释放，确认是真释放
             if (btn->release_count >= RELEASE_DEBOUNCE)
             {
+                // 计算按下持续时间
                 uint32_t held = now_ms - btn->press_start_ms;
-                if (held >= SHORT_PRESS_MIN_MS)
+                // 如果按下时间超过身体按键阈值，发送短按事件
+                if (held >= BODY_PRESS_MIN_MS)
                 {
-                    ESP_LOGI(TAG, ">>>> %s 短按 (%lums) <<<<", name, (unsigned long)held);
                     send_touch_event(short_evt);
                 }
+                // 重置按键状态
                 btn->is_pressed = false;
                 btn->press_start_ms = 0;
                 btn->release_count = 0;
@@ -273,21 +343,26 @@ static void update_body_btn(touch_btn_t *btn, bool pressed, bool in_combo,
 }
 
 /**
- * @brief 翻页按钮：以释放为结束时间，根据按住时长分发短按 / 长按。
- *
- * 按住期间不触发任何事件；释放后做防抖：
- *   ≥ PAGE_LONG_PRESS_MS  → 长按事件（进入功能菜单）
- *   ≥ SHORT_PRESS_MIN_MS  → 短按事件（翻页）
- *   小于以上阈值          → 视为误触，丢弃
- *
- * blocked 参数用于互斥锁定——当另一个翻页键已先被感应到，本键本轮被屏蔽。
+ * @brief 更新翻页键状态
+ * 函数含义：处理前后翻页键的状态机、消抖、长短按判断和事件发送
+ * @param btn           参数含义：按键结构体指针
+ * @param pressed_raw   参数含义：当前是否检测到按下（原始状态）
+ * @param blocked       参数含义：是否被互斥逻辑阻塞
+ * @param now_ms        参数含义：当前时间戳（毫秒）
+ * @param name          参数含义：按键名称（用于日志）
+ * @param short_evt     参数含义：短按事件类型
+ * @param long_evt      参数含义：长按事件类型
+ * @param long_press_ms 参数含义：长按阈值时间（毫秒）
  */
 static void update_page_btn(touch_btn_t *btn, bool pressed_raw, bool blocked,
                             uint32_t now_ms, const char *name,
-                            touch_event_t short_evt, touch_event_t long_evt)
+                            touch_event_t short_evt, touch_event_t long_evt,
+                            uint32_t long_press_ms)
 {
+    // 只有未被阻塞时才认为是有效按下
     bool pressed = pressed_raw && !blocked;
 
+    // 检测到按下
     if (pressed)
     {
         btn->release_count = 0;
@@ -300,8 +375,8 @@ static void update_page_btn(touch_btn_t *btn, bool pressed_raw, bool blocked,
                 btn->press_start_ms = now_ms;
             }
         }
-        // 按住期间一律不触发（"触摸时候一直不触发"）
     }
+    // 检测到释放
     else
     {
         btn->press_count = 0;
@@ -310,24 +385,30 @@ static void update_page_btn(touch_btn_t *btn, bool pressed_raw, bool blocked,
             btn->release_count++;
             if (btn->release_count >= RELEASE_DEBOUNCE)
             {
+                // 计算按下持续时间
                 uint32_t held = now_ms - btn->press_start_ms;
                 touch_event_t evt = TOUCH_EVENT_NONE;
                 const char *kind = NULL;
-                if (held >= PAGE_LONG_PRESS_MS)
+
+                // 判断是长按还是短按
+                if (held >= long_press_ms)
                 {
                     evt = long_evt;
                     kind = "长按";
                 }
-                else if (held >= SHORT_PRESS_MIN_MS)
+                else if (held >= PAGE_SHORT_PRESS_MIN_MS)
                 {
                     evt = short_evt;
                     kind = "短按";
                 }
+
+                // 发送对应事件
                 if (evt != TOUCH_EVENT_NONE)
                 {
-                    ESP_LOGI(TAG, ">>>> %s %s (%lums) <<<<", name, kind, (unsigned long)held);
                     send_touch_event(evt);
                 }
+
+                // 重置按键状态
                 btn->is_pressed = false;
                 btn->press_start_ms = 0;
                 btn->release_count = 0;
@@ -336,172 +417,210 @@ static void update_page_btn(touch_btn_t *btn, bool pressed_raw, bool blocked,
     }
 }
 
+/**
+ * @brief 触摸扫描任务
+ * 函数含义：FreeRTOS任务，持续扫描所有触摸按键，处理组合按键、互斥逻辑和事件分发
+ * @param pvParameters 参数含义：任务参数（未使用）
+ */
 void touch_scan_task(void *pvParameters)
 {
+    // 初始化触摸硬件
     bsp_touch_init();
-    printf("\n✅ 准备就绪！触摸铜箔触发情绪\n");
+    printf("\n触摸铜箔就绪\n");
 
     touch_event_t event;
+
+    // 主循环
     while (1)
     {
-        touch_pad_sw_start(); // 启动一次触摸测量，数据可通过 touch_pad_read_raw_data() 读取
+        // API含义：启动一次软件触摸测量
+        touch_pad_sw_start();
+
+        // 延时5毫秒等待测量完成
         vTaskDelay(pdMS_TO_TICKS(5));
 
-        uint32_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount()); // 获取当前时间
+        // API含义：获取当前系统时间（毫秒）
+        // API参数含义：xTaskGetTickCount()：获取当前系统时钟节拍数
+        uint32_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
 
+        // 上电初期屏蔽触摸检测，避免干扰
         if (now_ms < POWER_ON_MASK_TIME)
         {
             vTaskDelay(pdMS_TO_TICKS(15));
             continue;
         }
 
-        // ── 读取三个主按钮原始状态（最强信号优先，防串扰）────────────────────
-        int32_t dh = read_btn_delta(&btn_head);
-        int32_t da = read_btn_delta(&btn_abdomen);
-        int32_t db = read_btn_delta(&btn_back);
-        int32_t dp = read_btn_delta(&btn_prev_page);
-        int32_t dn = read_btn_delta(&btn_next_page);
-
-        // todo调试：每 ~500ms 打印一次 delta，便于现场标定阈值,后续删除
-        // static uint32_t s_last_log_ms = 0;
-        // if (now_ms - s_last_log_ms >= 1000)
-        // {
-        //     s_last_log_ms = now_ms;
-        //     ESP_LOGI(TAG, "delta: 头=%ld 腹=%ld 背=%ld 前=%ld 后=%ld",
-        //              (long)dh, (long)da, (long)db, (long)dp, (long)dn);
-        // }
+        /* ── 读取原始 delta（变化量） ── */
+        int32_t dh = read_btn_delta(&btn_head);    // 头部变化量
+        int32_t da = read_btn_delta(&btn_abdomen); // 腹部变化量
+        int32_t db = read_btn_delta(&btn_back);    // 背部变化量
 
         int32_t thresh_abs = TOUCH_MIN_DELTA;
+
+        // 初步判断各按键是否按下（同时满足绝对阈值和相对阈值）
         bool h_raw = (dh > thresh_abs) && (dh > (int32_t)(btn_head.baseline * TOUCH_THRESH_PERCENT));
         bool a_raw = (da > thresh_abs) && (da > (int32_t)(btn_abdomen.baseline * TOUCH_THRESH_PERCENT));
         bool b_raw = (db > thresh_abs) && (db > (int32_t)(btn_back.baseline * TOUCH_THRESH_PERCENT));
 
-        // 若多个按键同时超阈值且不是有效组合，只保留 delta 最大的那个
+        /* 多键同时超阈值时，只保留 delta 最大的（70% 阈值过滤串扰） */
         int active_count = (int)h_raw + (int)a_raw + (int)b_raw;
         bool h = h_raw, a = a_raw, b = b_raw;
+
         if (active_count > 1)
         {
-            // 允许真实组合（两个都很强：次强 > 70% 最强）
+            // 找出最大的delta值
             int32_t max_d = (dh > da ? dh : da);
             max_d = (max_d > db ? max_d : db);
+
+            // 设置组合按键阈值为最大值的70%
             int32_t combo_thresh = max_d * 7 / 10;
+
+            // 只有超过组合阈值的按键才被认为是真按下
             h = h_raw && (dh >= combo_thresh);
             a = a_raw && (da >= combo_thresh);
             b = b_raw && (db >= combo_thresh);
         }
 
-        // ── 组合检测（上升沿触发，持续按住不重复）────────────────────────────
-        bool combo_ha = h && a;
-        bool combo_hb = h && b;
-        bool combo_ab = a && b;
+        // 判断组合按键
+        bool combo_ha = h && a; // 头+腹
+        bool combo_hb = h && b; // 头+背
+        bool combo_ab = a && b; // 腹+背
 
-        if (combo_ha && !s_combo_ha_active)
-        {
-            s_combo_ha_active = true;
-            ESP_LOGI(TAG, ">>>> 头+腹 组合 <<<<");
-            send_touch_event(TOUCH_EVENT_COMBO_HEAD_ABDOMEN);
-        }
-        if (!combo_ha)
-            s_combo_ha_active = false;
-
-        if (combo_hb && !s_combo_hb_active)
-        {
-            s_combo_hb_active = true;
-            ESP_LOGI(TAG, ">>>> 头+背 组合 <<<<");
-            send_touch_event(TOUCH_EVENT_COMBO_HEAD_BACK);
-        }
-        if (!combo_hb)
-            s_combo_hb_active = false;
-
-        if (combo_ab && !s_combo_ab_active)
-        {
-            s_combo_ab_active = true;
-            ESP_LOGI(TAG, ">>>> 腹+背 组合 <<<<");
-            send_touch_event(TOUCH_EVENT_COMBO_ABDOMEN_BACK);
-        }
-        if (!combo_ab)
-            s_combo_ab_active = false;
-
-        // ── 单按钮短按（参与组合时跳过；不再有长按）─────────────────────────
-        update_body_btn(&btn_head, h, combo_ha || combo_hb, now_ms,
-                        "头部", TOUCH_EVENT_SHORT_HEAD);
-        update_body_btn(&btn_abdomen, a, combo_ha || combo_ab, now_ms,
-                        "腹部", TOUCH_EVENT_SHORT_ABDOMEN);
-        update_body_btn(&btn_back, b, combo_hb || combo_ab, now_ms,
-                        "背部", TOUCH_EVENT_SHORT_BACK);
-
-        // ── 翻页按钮 ──────────────────────────────────────────────────────
-        // 互斥锁定：两键同时被触摸时只保留先感应到的；占用方释放后才释放锁
+        /* ── 翻页键原始状态 ── */
         bool prev_raw = read_btn_pressed(&btn_prev_page);
         bool next_raw = read_btn_pressed(&btn_next_page);
 
+        /* ── 翻页键互斥逻辑 ── */
         if (s_page_owner == PAGE_OWNER_NONE)
         {
-            // 仅在恰好只有一个被按下时确权；同帧两键齐起则均屏蔽，等下一帧解决
+            // 前页先按下，前页占用
             if (prev_raw && !next_raw)
                 s_page_owner = PAGE_OWNER_PREV;
+            // 后页先按下，后页占用
             else if (next_raw && !prev_raw)
                 s_page_owner = PAGE_OWNER_NEXT;
         }
 
+        // 判断是否被阻塞
         bool prev_blocked = (s_page_owner != PAGE_OWNER_NONE && s_page_owner != PAGE_OWNER_PREV);
         bool next_blocked = (s_page_owner != PAGE_OWNER_NONE && s_page_owner != PAGE_OWNER_NEXT);
 
-        update_page_btn(&btn_prev_page, prev_raw, prev_blocked, now_ms,
-                        "前一页", TOUCH_EVENT_SHORT_PREV_PAGE, TOUCH_EVENT_LONG_PREV_PAGE);
-        update_page_btn(&btn_next_page, next_raw, next_blocked, now_ms,
-                        "后一页", TOUCH_EVENT_SHORT_NEXT_PAGE, TOUCH_EVENT_LONG_NEXT_PAGE);
+        /* ══════════════════════════════════════════════════════════
+         * 【核心改动】根据当前视图决定行为
+         * ══════════════════════════════════════════════════════════ */
+        // API含义：获取当前UI视图状态
+        ui_view_t cur_view = ui_get_current_view();
 
-        // 占用方完成释放（is_pressed 已被 update_page_btn 清零）后释放锁
+        /* 所有视图统一使用 3 秒长按阈值 */
+        uint32_t long_press_ms = PAGE_LONG_PRESS_MS;
+
+        /* 组合触摸：仅主界面启用 */
+        bool body_combo_enabled = (cur_view == UI_VIEW_MAIN);
+        if (body_combo_enabled)
+        {
+            // 头+腹组合（需连续 PRESS_DEBOUNCE 次才触发，防止滑动误触）
+            if (combo_ha)
+            {
+                if (!s_combo_ha_active)
+                {
+                    if (++s_combo_ha_cnt >= PRESS_DEBOUNCE)
+                    {
+                        s_combo_ha_active = true;
+                        send_touch_event(TOUCH_EVENT_COMBO_HEAD_ABDOMEN);
+                    }
+                }
+            }
+            else
+            {
+                s_combo_ha_active = false;
+                s_combo_ha_cnt = 0;
+            }
+
+            // 头+背组合
+            if (combo_hb)
+            {
+                if (!s_combo_hb_active)
+                {
+                    if (++s_combo_hb_cnt >= PRESS_DEBOUNCE)
+                    {
+                        s_combo_hb_active = true;
+                        send_touch_event(TOUCH_EVENT_COMBO_HEAD_BACK);
+                    }
+                }
+            }
+            else
+            {
+                s_combo_hb_active = false;
+                s_combo_hb_cnt = 0;
+            }
+
+            // 腹+背组合
+            if (combo_ab)
+            {
+                if (!s_combo_ab_active)
+                {
+                    if (++s_combo_ab_cnt >= PRESS_DEBOUNCE)
+                    {
+                        s_combo_ab_active = true;
+                        send_touch_event(TOUCH_EVENT_COMBO_ABDOMEN_BACK);
+                    }
+                }
+            }
+            else
+            {
+                s_combo_ab_active = false;
+                s_combo_ab_cnt = 0;
+            }
+        }
+        else
+        {
+            // 非主界面，清除组合按键状态
+            s_combo_ha_active = false;
+            s_combo_ha_cnt = 0;
+            s_combo_hb_active = false;
+            s_combo_hb_cnt = 0;
+            s_combo_ab_active = false;
+            s_combo_ab_cnt = 0;
+        }
+
+        /* 身体单按钮：仅主界面启用（非主界面时 in_combo=true 跳过） */
+        bool body_enabled = (cur_view == UI_VIEW_MAIN);
+
+        // 更新头部按键
+        update_body_btn(&btn_head, h, combo_ha || combo_hb || !body_enabled, now_ms,
+                        "头部", TOUCH_EVENT_SHORT_HEAD);
+        // 更新腹部按键
+        update_body_btn(&btn_abdomen, a, combo_ha || combo_ab || !body_enabled, now_ms,
+                        "腹部", TOUCH_EVENT_SHORT_ABDOMEN);
+        // 更新背部按键
+        update_body_btn(&btn_back, b, combo_hb || combo_ab || !body_enabled, now_ms,
+                        "背部", TOUCH_EVENT_SHORT_BACK);
+
+        /* 翻页按钮（传入动态长按阈值） */
+        // 更新前页键
+        update_page_btn(&btn_prev_page, prev_raw, prev_blocked, now_ms,
+                        "前页", TOUCH_EVENT_SHORT_PREV_PAGE, TOUCH_EVENT_LONG_PREV_PAGE,
+                        long_press_ms);
+        // 更新后页键
+        update_page_btn(&btn_next_page, next_raw, next_blocked, now_ms,
+                        "后页", TOUCH_EVENT_SHORT_NEXT_PAGE, TOUCH_EVENT_LONG_NEXT_PAGE,
+                        long_press_ms);
+
+        /* 占用方释放：当按键释放后，清除占用状态 */
         if (s_page_owner == PAGE_OWNER_PREV && !btn_prev_page.is_pressed && !prev_raw)
             s_page_owner = PAGE_OWNER_NONE;
         if (s_page_owner == PAGE_OWNER_NEXT && !btn_next_page.is_pressed && !next_raw)
             s_page_owner = PAGE_OWNER_NONE;
 
-        // ── 事件 → 情绪矩阵 ──────────────────────────────────────────────────
+        /* ── 事件分发：统一交给 ui_dispatch_touch_event ── */
         if (bsp_touch_get_event(&event))
         {
-            switch (event)
-            {
-            case TOUCH_EVENT_SHORT_HEAD:
-                SHOW_EMO(g_emo_head);
-                ui_interaction_play(EMO_HAPPY);
-                break;
-            case TOUCH_EVENT_SHORT_ABDOMEN:
-                SHOW_EMO(g_emo_abdomen);
-                ui_interaction_play(EMO_COMFORTABLE);
-                break;
-            case TOUCH_EVENT_SHORT_BACK:
-                SHOW_EMO(g_emo_back);
-                ui_interaction_play(EMO_TICKLISH);
-                break;
-            case TOUCH_EVENT_COMBO_HEAD_ABDOMEN:
-                SHOW_EMO(g_emo_head_abdomen);
-                ui_interaction_play(EMO_SHY_RUB);
-                break;
-            case TOUCH_EVENT_COMBO_HEAD_BACK:
-                SHOW_EMO(g_emo_head_back);
-                ui_interaction_play(EMO_EXCITED);
-                break;
-            case TOUCH_EVENT_COMBO_ABDOMEN_BACK:
-                SHOW_EMO(g_emo_abdomen_back);
-                ui_interaction_play(EMO_COMFORTABLE_ROLL);
-                break;
-            case TOUCH_EVENT_SHORT_PREV_PAGE:
-                ui_page_prev();
-                break;
-            case TOUCH_EVENT_SHORT_NEXT_PAGE:
-                ui_page_next();
-                break;
-            case TOUCH_EVENT_LONG_PREV_PAGE:
-            case TOUCH_EVENT_LONG_NEXT_PAGE:
-                ui_function_menu_enter();
-                break;
-            default:
-                break;
-            }
+            // API含义：将触摸事件分发到UI层进行处理
+            // API参数含义：event：触摸事件类型
+            ui_dispatch_touch_event(event);
         }
 
+        // 延时15毫秒，控制扫描周期约20毫秒（50Hz）
         vTaskDelay(pdMS_TO_TICKS(15));
     }
 }

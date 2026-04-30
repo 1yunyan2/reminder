@@ -1194,6 +1194,30 @@ esp_err_t reminder_alarm_set_enabled(uint8_t alarm_id, bool enabled)
     ESP_LOGI(TAG, "闹钟 #%d %s", alarm_id, enabled ? "启用" : "禁用");
     return ESP_OK;
 }
+esp_err_t reminder_alarm_update(uint8_t alarm_id, const alarm_entry_t *entry)
+{
+    if (entry == NULL)
+        return ESP_ERR_INVALID_ARG;
+
+    xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+
+    if (alarm_id >= s_ctx.alarm_count)
+    {
+        xSemaphoreGive(s_ctx.mutex);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    alarm_entry_t updated = *entry;
+    updated.id = alarm_id;
+    updated.enabled = true;
+    s_ctx.alarms[alarm_id] = updated;
+
+    nvs_save_alarms();
+    xSemaphoreGive(s_ctx.mutex);
+
+    ESP_LOGI(TAG, "更新闹钟 #%d: %02d:%02d", alarm_id, updated.hour, updated.minute);
+    return ESP_OK;
+}
 
 void reminder_alarm_get_all(alarm_entry_t *out_list, uint8_t *out_count)
 {
