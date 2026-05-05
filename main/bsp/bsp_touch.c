@@ -13,9 +13,10 @@
 #include "driver/touch_pad.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "bsp/bsp_config.h"
 #include "ui/interaction.h"
-#include "ui/ui_port.h" /* ← 新增：ui_get_current_view / ui_dispatch_touch_event */
+#include "ui/ui_port.h"
 
 // 日志标签，用于ESP_LOG输出
 static const char *TAG = "BSP_TOUCH";
@@ -26,21 +27,21 @@ static const char *TAG = "BSP_TOUCH";
 static QueueHandle_t s_touch_event_queue = NULL;
 
 // 触摸触发阈值百分比（相对于基线的变化率）
-#define TOUCH_THRESH_PERCENT 0.05f
-// 上电屏蔽时间（毫秒），上电后2秒内不检测触摸，避免上电干扰
-#define POWER_ON_MASK_TIME 2000
+#define TOUCH_THRESH_PERCENT 0.15f
+// 上电屏蔽时间（毫秒），上电后4秒内不检测触摸，避免上电干扰和基线漂移
+#define POWER_ON_MASK_TIME 4000
 // 触摸最小绝对变化量（原始值），低于此值认为是噪声
 #define TOUCH_MIN_DELTA 2000
 // 身体按键（头/腹/背）有效按压最小持续时间（毫秒）
-#define BODY_PRESS_MIN_MS 300
+#define BODY_PRESS_MIN_MS 200
 // 翻页键短按最小持续时间（毫秒）
 #define PAGE_SHORT_PRESS_MIN_MS 100
 // 翻页键长按阈值时间（毫秒）
-#define PAGE_LONG_PRESS_MS 3000
+#define PAGE_LONG_PRESS_MS 1000
 // 按下消抖计数（需要连续检测到多少次按下才算真按下）
 #define PRESS_DEBOUNCE 2
 // 释放消抖计数（需要连续检测到多少次释放才算真释放）
-#define RELEASE_DEBOUNCE 4
+#define RELEASE_DEBOUNCE 3
 
 /**
  * @brief 触摸按键状态结构体
@@ -88,6 +89,8 @@ typedef enum
 
 // 当前翻页键占用者
 static page_owner_t s_page_owner = PAGE_OWNER_NONE;
+// 翻页键最后活跃时间（用于松手后冷却，防止电容耦合误触身体键）
+static uint32_t s_page_active_ms = 0;
 
 /**
  * @brief 发送触摸事件到队列
@@ -291,7 +294,7 @@ static void update_body_btn(touch_btn_t *btn, bool pressed, bool in_combo,
                             uint32_t now_ms, const char *name,
                             touch_event_t short_evt)
 {
-    // 如果处于组合按键状态，重置单键状态并返回
+    // 如果处于组合按键状态或被其他按键占用，彻底重置状态并返回
     if (in_combo)
     {
         btn->is_pressed = false;
@@ -440,8 +443,7 @@ void touch_scan_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(5));
 
         // API含义：获取当前系统时间（毫秒）
-        // API参数含义：xTaskGetTickCount()：获取当前系统时钟节拍数
-        uint32_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
         // 上电初期屏蔽触摸检测，避免干扰
         if (now_ms < POWER_ON_MASK_TIME)
@@ -450,45 +452,68 @@ void touch_scan_task(void *pvParameters)
             continue;
         }
 
-        /* ── 读取原始 delta（变化量） ── */
-        int32_t dh = read_btn_delta(&btn_head);    // 头部变化量
-        int32_t da = read_btn_delta(&btn_abdomen); // 腹部变化量
-        int32_t db = read_btn_delta(&btn_back);    // 背部变化量
+        /* ── 一次性读取全部 5 通道 delta ── */
+        int32_t dh = read_btn_delta(&btn_head);
+        int32_t da = read_btn_delta(&btn_abdomen);
+        int32_t db = read_btn_delta(&btn_back);
+        int32_t dp = read_btn_delta(&btn_prev_page);
+        int32_t dn = read_btn_delta(&btn_next_page);
 
         int32_t thresh_abs = TOUCH_MIN_DELTA;
 
-        // 初步判断各按键是否按下（同时满足绝对阈值和相对阈值）
+        /* 软件兜底：翻页键通道有信号时，清零头通道。
+         * PCB 走线串扰导致翻页键触摸时头通道 h 值异常暴增，
+         * 此操作在 h_raw 计算之前从源头消除误触发。 */
+        if (dn > thresh_abs || dp > thresh_abs)
+            dh = 0;
+
+        /* 各通道初步判断：delta > 绝对阈值 且 > 基线×相对阈值 */
         bool h_raw = (dh > thresh_abs) && (dh > (int32_t)(btn_head.baseline * TOUCH_THRESH_PERCENT));
         bool a_raw = (da > thresh_abs) && (da > (int32_t)(btn_abdomen.baseline * TOUCH_THRESH_PERCENT));
         bool b_raw = (db > thresh_abs) && (db > (int32_t)(btn_back.baseline * TOUCH_THRESH_PERCENT));
+        bool prev_raw = (dp > thresh_abs) && (dp > (int32_t)(btn_prev_page.baseline * TOUCH_THRESH_PERCENT));
+        bool next_raw = (dn > thresh_abs) && (dn > (int32_t)(btn_next_page.baseline * TOUCH_THRESH_PERCENT));
 
-        /* 多键同时超阈值时，只保留 delta 最大的（70% 阈值过滤串扰） */
-        int active_count = (int)h_raw + (int)a_raw + (int)b_raw;
         bool h = h_raw, a = a_raw, b = b_raw;
 
-        if (active_count > 1)
+        /* ── 第一步：身体键之间组合过滤（保留原逻辑，允许多键组合） ── */
         {
-            // 找出最大的delta值
-            int32_t max_d = (dh > da ? dh : da);
-            max_d = (max_d > db ? max_d : db);
+            int body_cnt = (int)h + (int)a + (int)b;
+            if (body_cnt > 1)
+            {
+                int32_t max_body = dh;
+                if (da > max_body)
+                    max_body = da;
+                if (db > max_body)
+                    max_body = db;
+                int32_t body_thresh = max_body * 7 / 10;
+                h = h && (dh >= body_thresh);
+                a = a && (da >= body_thresh);
+                b = b && (db >= body_thresh);
+            }
+        }
 
-            // 设置组合按键阈值为最大值的70%
-            int32_t combo_thresh = max_d * 7 / 10;
+        /* ── 第二步：翻页键之间互斥（只保留 delta 更大的） ── */
+        if (prev_raw && next_raw)
+        {
+            if (dp >= dn)
+                next_raw = false;
+            else
+                prev_raw = false;
+        }
 
-            // 只有超过组合阈值的按键才被认为是真按下
-            h = h_raw && (dh >= combo_thresh);
-            a = a_raw && (da >= combo_thresh);
-            b = b_raw && (db >= combo_thresh);
+        /* ── 第三步：翻页键按下时，直接屏蔽所有身体键（彻底杜绝串扰） ── */
+        if (prev_raw || next_raw)
+        {
+            h = false;
+            a = false;
+            b = false;
         }
 
         // 判断组合按键
         bool combo_ha = h && a; // 头+腹
         bool combo_hb = h && b; // 头+背
         bool combo_ab = a && b; // 腹+背
-
-        /* ── 翻页键原始状态 ── */
-        bool prev_raw = read_btn_pressed(&btn_prev_page);
-        bool next_raw = read_btn_pressed(&btn_next_page);
 
         /* ── 翻页键互斥逻辑 ── */
         if (s_page_owner == PAGE_OWNER_NONE)
@@ -585,15 +610,20 @@ void touch_scan_task(void *pvParameters)
 
         /* 身体单按钮：仅主界面启用（非主界面时 in_combo=true 跳过） */
         bool body_enabled = (cur_view == UI_VIEW_MAIN);
+        bool page_any_active = prev_raw || next_raw;
+        if (page_any_active)
+            s_page_active_ms = now_ms;
+        // 翻页键松开后 100ms 内仍屏蔽身体键，等待电容耦合信号衰减
+        bool page_blocking = page_any_active || ((now_ms - s_page_active_ms) < 100);
 
         // 更新头部按键
-        update_body_btn(&btn_head, h, combo_ha || combo_hb || !body_enabled, now_ms,
+        update_body_btn(&btn_head, h, combo_ha || combo_hb || !body_enabled || page_blocking, now_ms,
                         "头部", TOUCH_EVENT_SHORT_HEAD);
         // 更新腹部按键
-        update_body_btn(&btn_abdomen, a, combo_ha || combo_ab || !body_enabled, now_ms,
+        update_body_btn(&btn_abdomen, a, combo_ha || combo_ab || !body_enabled || page_blocking, now_ms,
                         "腹部", TOUCH_EVENT_SHORT_ABDOMEN);
         // 更新背部按键
-        update_body_btn(&btn_back, b, combo_hb || combo_ab || !body_enabled, now_ms,
+        update_body_btn(&btn_back, b, combo_hb || combo_ab || !body_enabled || page_blocking, now_ms,
                         "背部", TOUCH_EVENT_SHORT_BACK);
 
         /* 翻页按钮（传入动态长按阈值） */
@@ -615,8 +645,7 @@ void touch_scan_task(void *pvParameters)
         /* ── 事件分发：统一交给 ui_dispatch_touch_event ── */
         if (bsp_touch_get_event(&event))
         {
-            // API含义：将触摸事件分发到UI层进行处理
-            // API参数含义：event：触摸事件类型
+            ESP_LOGI(TAG, "触摸事件: %d, 当前视图: %d", (int)event, (int)ui_get_current_view());
             ui_dispatch_touch_event(event);
         }
 

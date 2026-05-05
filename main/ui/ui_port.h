@@ -108,4 +108,6 @@ void ui_dispatch_touch_event(touch_event_t event);
  */
 ui_view_t ui_get_current_view(void);
 
+static void time_page_render_text(void);
+
 #endif /* UI_PORT_H */

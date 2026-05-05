@@ -1,22 +1,21 @@
 /**
  * @file reminder.c
- * @brief 提醒系统实现 — 闹钟/倒计时/日历/天气 四合一引擎
+ * @brief 提醒系统实现 — 闹钟/倒计时/日历/天气 四合一引擎（修复版）
  *
- * 核心机制：
- *   1. 使用 esp_timer 创建 1 秒轮询定时器（心跳）
- *   2. 轮询回调仅做"事件投递"，不做耗时操作
- *   3. 独立的 reminder_task 处理所有提醒逻辑（播报、HTTP、震动等）
- *   4. 优先级队列：闹钟 > 倒计时 > 日历 > 天气
- *
- * 闹钟响铃流程：
- *   闹钟到点 → 进入 RINGING 状态 → 每 5 秒重复播报+震动+舵机
- *   → 用户语音"关闭" → reminder_alarm_dismiss() → 回到 IDLE
- *   → 或 60 秒无响应 → 自动关闭
- *
- * 线程模型：
- *   - poll_timer_callback: esp_timer 上下文，仅投递事件到队列（轻量）
- *   - reminder_task: 独立 FreeRTOS 任务，处理所有提醒逻辑（8KB 栈）
- *   - mutex 保护共享数据（闹钟/日历/倒计时列表）
+ * 修复清单（共 13 处）：
+ *  [FIX-1]  NVS 保存命令常量，闹钟/日历统一走异步队列
+ *  [FIX-2]  事件类型新增 REM_EVT_SHUTDOWN，安全关闭任务
+ *  [FIX-3]  poll_timer_callback 互斥锁协议修复（检查返回值）
+ *  [FIX-4]  alarm_ring_start 定时器创建失败时回退到 IDLE
+ *  [FIX-5]  nvs_save_calendars 改为异步（通过队列）
+ *  [FIX-6]  nvs_save_task 支持多命令分发
+ *  [FIX-7]  reminder_task 处理 SHUTDOWN 事件，安全自退出
+ *  [FIX-8]  reminder_init 失败路径完整清理资源
+ *  [FIX-9]  reminder_deinit 安全关闭（SHUTDOWN 信号 + 等待）
+ *  [FIX-10] strncpy 显式 null 终止
+ *  [FIX-11] reminder_task 栈增大到 12KB（天气 HTTP 需要）
+ *  [FIX-12] reminder_alarm_update/add 不强制 enabled=true
+ *  [FIX-13] esp_timer_create 失败后 alarm_ring_stop 安全处理
  */
 
 #include "reminder.h"
@@ -34,129 +33,103 @@
 #include <string.h>
 #include <sys/time.h>
 
-static const char *TAG = "REMINDER"; // 提醒模块
+static const char *TAG = "REMINDER";
 
 /* ═══════════════════════════════════════════════════════════════════
- * 时区配置 — 后续接入其他地区只需改这一处
- *
- * 默认中国标准时间 (CST-8)。
- * 若需切换地区：
- *   - 编译时覆盖：在 CMakeLists 加 add_compile_definitions(REMINDER_TZ="JST-9")
- *   - 或直接修改下方默认值
- *
- * 常用 POSIX TZ 字符串：
- *   "CST-8"                       中国 / 新加坡 (UTC+8)
- *   "JST-9"                       日本          (UTC+9)
- *   "KST-9"                       韩国          (UTC+9)
- *   "EST5EDT,M3.2.0,M11.1.0"      美东 (含夏令时)
- *   "PST8PDT,M3.2.0,M11.1.0"      美西 (含夏令时)
- *   "GMT0BST,M3.5.0/1,M10.5.0"    英国 (含夏令时)
- *   "UTC0"                        UTC
- *
- * 后续做"按地区动态切换"时，运行时调用 setenv("TZ", ...) + tzset() 即可。
+ * 时区配置
  * ═══════════════════════════════════════════════════════════════════ */
 #ifndef REMINDER_TZ
 #define REMINDER_TZ "CST-8"
 #endif
 
 /* ═══════════════════════════════════════════════════════════════════
- * 演示模式（无 WiFi）——注释掉下面这一行即切回 SNTP 联网同步。
- *
- * 修改演示起始时间：直接改 MOCK_HOUR / MOCK_MIN / MOCK_DAY 的默认值。
- * 演示时钟会正常走秒；断电重启后重置为此处设定的起始时间。
+ * 演示模式
  * ═══════════════════════════════════════════════════════════════════ */
-#define REMINDER_MOCK_TIME /* <<< 注释掉此行 = 切回联网 SNTP */
+#define REMINDER_MOCK_TIME
 
-#ifdef REMINDER_MOCK_TIME  ///< 模拟时钟
-#ifndef REMINDER_MOCK_YEAR ///< 模拟年份
+#ifdef REMINDER_MOCK_TIME
+#ifndef REMINDER_MOCK_YEAR
 #define REMINDER_MOCK_YEAR 2026
 #endif
-#ifndef REMINDER_MOCK_MON ///< 模拟月份
+#ifndef REMINDER_MOCK_MON
 #define REMINDER_MOCK_MON 4
 #endif
-#ifndef REMINDER_MOCK_DAY ///< 模拟日期
+#ifndef REMINDER_MOCK_DAY
 #define REMINDER_MOCK_DAY 29
 #endif
-#ifndef REMINDER_MOCK_HOUR ///< 模拟小时
+#ifndef REMINDER_MOCK_HOUR
 #define REMINDER_MOCK_HOUR 10
 #endif
-#ifndef REMINDER_MOCK_MIN ///< 模拟分钟
+#ifndef REMINDER_MOCK_MIN
 #define REMINDER_MOCK_MIN 0
 #endif
-#endif /* REMINDER_MOCK_TIME */ // 模拟时钟
+#endif /* REMINDER_MOCK_TIME */
 
 /* ═══════════════════════════════════════════════════════════════════
- * 1. 内部事件定义（定时器→任务的通信协议）
+ * [FIX-1] NVS 保存命令常量
  * ═══════════════════════════════════════════════════════════════════ */
+#define NVS_SAVE_CMD_ALARMS 0x01
+#define NVS_SAVE_CMD_CALENDARS 0x02
+#define NVS_SAVE_CMD_EXIT 0xFF
 
-/**
- * @brief 提醒事件类型（投递到 reminder_task 的事件队列）
- */
+/* ═══════════════════════════════════════════════════════════════════
+ * 1. 内部事件定义
+ * ═══════════════════════════════════════════════════════════════════ */
 typedef enum
 {
-    REM_EVT_ALARM_TRIGGER,    ///< 闹钟到点（附带闹钟 ID）
-    REM_EVT_TIMER_EXPIRE,     ///< 倒计时到期（附带 timer ID）
-    REM_EVT_CALENDAR_TRIGGER, ///< 日历事件触发（附带事件 ID）
-    REM_EVT_WEATHER_FETCH,    ///< 天气播报时间到//todo天气播报也不需要？为什么要播报？
-    REM_EVT_ALARM_DISMISS,    ///< 用户关闭闹钟
-    REM_EVT_ALARM_RING_TICK,  ///< 闹钟响铃循环（每 5 秒重复）
+    REM_EVT_ALARM_TRIGGER,
+    REM_EVT_TIMER_EXPIRE,
+    REM_EVT_CALENDAR_TRIGGER,
+    REM_EVT_WEATHER_FETCH,
+    REM_EVT_ALARM_DISMISS,
+    REM_EVT_ALARM_RING_TICK,
+    /* [FIX-2] 安全关闭信号 */
+    REM_EVT_SHUTDOWN,
 } reminder_evt_type_t;
 
-/**
- * @brief 提醒事件结构体
- */
 typedef struct
 {
-    reminder_evt_type_t type;           ///< 事件类型
-    uint8_t id;                         ///< 关联的闹钟/倒计时/日历 ID
-    char message[REMINDER_MSG_MAX_LEN]; ///< 提醒消息内容
+    reminder_evt_type_t type;
+    uint8_t id;
+    char message[REMINDER_MSG_MAX_LEN];
 } reminder_evt_t;
 
 /* ═══════════════════════════════════════════════════════════════════
- * 2. 运行时上下文（模块内单例）
+ * 2. 运行时上下文
  * ═══════════════════════════════════════════════════════════════════ */
-
 typedef struct
 {
-    /* 回调 */
-    reminder_trigger_cb_t trigger_cb; //< 提醒触发回调
+    reminder_trigger_cb_t trigger_cb;
+    reminder_state_t state;
 
-    /* 状态 */
-    reminder_state_t state; ///< 当前状态
-
-    /* 闹钟数据 */
     alarm_entry_t alarms[REMINDER_MAX_ALARMS];
-    uint8_t alarm_count; //< 闹钟数量
+    uint8_t alarm_count;
 
-    /* 倒计时数据 */
     timer_entry_t timers[REMINDER_MAX_TIMERS];
 
-    /* 日历数据 */
     calendar_entry_t calendars[REMINDER_MAX_CALENDARS];
     uint8_t calendar_count;
 
-    /* 天气配置 */
     weather_config_t weather_cfg;
-    bool weather_morning_done; ///< 今天早间播报已完成
-    bool weather_evening_done; ///< 今天晚间播报已完成
-    uint8_t last_weather_day;  ///< 上次天气播报的日期（跨日重置用）
+    /* [FIX-3 注] 天气标志仅在 poll_timer_callback 中读写（单上下文），
+     * reminder_weather_config 写入时持锁，存在良性竞态（最多多/少播报一次） */
+    bool weather_morning_done;
+    bool weather_evening_done;
+    uint8_t last_weather_day;
 
-    /* 闹钟响铃状态 */
-    uint8_t ringing_alarm_id;      ///< 当前正在响铃的闹钟 ID
-    uint8_t ring_count;            ///< 已响铃次数
-    esp_timer_handle_t ring_timer; ///< 响铃循环定时器（每 5 秒触发）
+    uint8_t ringing_alarm_id;
+    uint8_t ring_count;
+    esp_timer_handle_t ring_timer;
 
-    /* 防重复触发：记录上次触发的分钟数，避免同一分钟内重复触发 */
-    int last_alarm_check_min; ///< 上次闹钟检查的分钟（-1=未检查）
-    int last_cal_check_min;   ///< 上次日历检查的分钟
+    int last_alarm_check_min;
+    int last_cal_check_min;
 
-    /* 系统资源 */
-    esp_timer_handle_t poll_timer; ///< 1 秒轮询定时器
-    QueueHandle_t evt_queue;       ///< 事件队列（定时器→任务）
-    TaskHandle_t task_handle;      ///< 提醒任务句柄
-    SemaphoreHandle_t mutex;       ///< 互斥锁（保护共享数据）
-    bool sntp_synced;              ///< SNTP 是否已同步
-    bool initialized;              ///< 模块是否已初始化
+    esp_timer_handle_t poll_timer;
+    QueueHandle_t evt_queue;
+    TaskHandle_t task_handle;
+    SemaphoreHandle_t mutex;
+    bool sntp_synced;
+    bool initialized;
 } reminder_ctx_t;
 
 static reminder_ctx_t s_ctx = {0};
@@ -164,16 +137,11 @@ static reminder_ctx_t s_ctx = {0};
 #define NVS_NAMESPACE "reminder"
 
 /* ═══════════════════════════════════════════════════════════════════
- * 3. NVS 持久化（内部函数）
+ * 3. NVS 持久化
  * ═══════════════════════════════════════════════════════════════════ */
+static QueueHandle_t s_save_queue = NULL;
 
-/**
- * @brief 保存所有闹钟到 NVS
- *
- * 以 "alarm_cnt" 存总数，"alarm_0"~"alarm_7" 存各条 blob。
- * 调用时机：add / delete / enable / disable 后立即保存。
- */
-static void nvs_save_alarms(void)
+static void nvs_save_alarms_immediate(void)
 {
     nvs_handle_t handle;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK)
@@ -181,24 +149,85 @@ static void nvs_save_alarms(void)
         ESP_LOGE(TAG, "NVS 打开失败，无法保存闹钟");
         return;
     }
-
-    nvs_set_u8(handle, "alarm_cnt", s_ctx.alarm_count); // 给闹钟数设置一个键值对，全都存入
+    nvs_set_u8(handle, "alarm_cnt", s_ctx.alarm_count);
     for (uint8_t i = 0; i < s_ctx.alarm_count; i++)
     {
         char key[16];
-        snprintf(key, sizeof(key), "alarm_%d", i); // 每次将第i个闹钟名字作为密钥保存到NVS中，格式化字符串
-        // 句柄，密钥，数据，数据长度
-        nvs_set_blob(handle, key, &s_ctx.alarms[i], sizeof(alarm_entry_t)); // 2进制大对象？将原始字节转换为2进制存储，无论多大
+        snprintf(key, sizeof(key), "alarm_%d", i);
+        nvs_set_blob(handle, key, &s_ctx.alarms[i], sizeof(alarm_entry_t));
     }
-
-    nvs_commit(handle); // setBLOB之后必需使用commit才能真正写入闪存，因为blob解析，只会将字节cp到闪存？
-    nvs_close(handle);  // 关闭
+    nvs_commit(handle);
+    nvs_close(handle);
     ESP_LOGI(TAG, "闹钟数据已保存，共 %d 条", s_ctx.alarm_count);
 }
 
-/**
- * @brief 从 NVS 加载闹钟
- */
+/* [FIX-5] 日历 NVS 写入拆为 immediate 版本，供异步任务调用 */
+static void nvs_save_calendars_immediate(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "NVS 打开失败，无法保存日历");
+        return;
+    }
+    nvs_set_u8(handle, "cal_cnt", s_ctx.calendar_count);
+    for (uint8_t i = 0; i < s_ctx.calendar_count; i++)
+    {
+        char key[16];
+        snprintf(key, sizeof(key), "cal_%02d", i);
+        nvs_set_blob(handle, key, &s_ctx.calendars[i], sizeof(calendar_entry_t));
+    }
+    nvs_commit(handle);
+    nvs_close(handle);
+    ESP_LOGI(TAG, "日历数据已保存，共 %d 条", s_ctx.calendar_count);
+}
+
+/* [FIX-6] NVS 保存任务支持闹钟/日历/退出三种命令 */
+static void nvs_save_task(void *arg)
+{
+    uint8_t cmd;
+    while (1)
+    {
+        if (xQueueReceive(s_save_queue, &cmd, portMAX_DELAY) == pdTRUE)
+        {
+            if (cmd == NVS_SAVE_CMD_EXIT)
+                break;
+
+            xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+            switch (cmd)
+            {
+            case NVS_SAVE_CMD_ALARMS:
+                nvs_save_alarms_immediate();
+                break;
+            case NVS_SAVE_CMD_CALENDARS:
+                nvs_save_calendars_immediate();
+                break;
+            default:
+                ESP_LOGW(TAG, "NVS 保存任务收到未知命令: 0x%02X", cmd);
+                break;
+            }
+            xSemaphoreGive(s_ctx.mutex);
+        }
+    }
+    ESP_LOGI(TAG, "NVS 保存任务已退出");
+    vTaskDelete(NULL);
+}
+
+static void nvs_save_alarms(void)
+{
+    uint8_t cmd = NVS_SAVE_CMD_ALARMS;
+    if (s_save_queue)
+        xQueueSend(s_save_queue, &cmd, 0);
+}
+
+/* [FIX-5] 日历保存改为异步 */
+static void nvs_save_calendars(void)
+{
+    uint8_t cmd = NVS_SAVE_CMD_CALENDARS;
+    if (s_save_queue)
+        xQueueSend(s_save_queue, &cmd, 0);
+}
+
 static void nvs_load_alarms(void)
 {
     nvs_handle_t handle;
@@ -207,59 +236,27 @@ static void nvs_load_alarms(void)
         ESP_LOGW(TAG, "NVS 无闹钟数据（首次启动）");
         return;
     }
-
     uint8_t count = 0;
-    if (nvs_get_u8(handle, "alarm_cnt", &count) == ESP_OK) // 根据键：alarm_cnt 从 NVS 获取数据
+    if (nvs_get_u8(handle, "alarm_cnt", &count) == ESP_OK)
     {
-        s_ctx.alarm_count = (count > REMINDER_MAX_ALARMS) ? REMINDER_MAX_ALARMS : count; // 闹钟数量
+        s_ctx.alarm_count = (count > REMINDER_MAX_ALARMS) ? REMINDER_MAX_ALARMS : count;
         for (uint8_t i = 0; i < s_ctx.alarm_count; i++)
         {
             char key[16];
-            snprintf(key, sizeof(key), "alarm_%d", i); // 开辟一个16字节的key并且转换为字符串
+            snprintf(key, sizeof(key), "alarm_%d", i);
             size_t len = sizeof(alarm_entry_t);
-            nvs_get_blob(handle, key, &s_ctx.alarms[i], &len); // 读取nvs中闹钟数据
+            nvs_get_blob(handle, key, &s_ctx.alarms[i], &len);
         }
         ESP_LOGI(TAG, "从 NVS 加载 %d 条闹钟", s_ctx.alarm_count);
     }
-    nvs_close(handle); // 关闭nvs句柄
-}
-
-/**
- * @brief 保存所有日历事件到 NVS
- */
-static void nvs_save_calendars(void)
-{
-    nvs_handle_t handle;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK)
-    {
-        ESP_LOGE(TAG, "NVS 打开失败，无法保存日历");
-        return;
-    }
-
-    nvs_set_u8(handle, "cal_cnt", s_ctx.calendar_count);
-    for (uint8_t i = 0; i < s_ctx.calendar_count; i++)
-    {
-        char key[16];
-        snprintf(key, sizeof(key), "cal_%02d", i);
-        nvs_set_blob(handle, key, &s_ctx.calendars[i], sizeof(calendar_entry_t));
-    }
-
-    nvs_commit(handle);
     nvs_close(handle);
-    ESP_LOGI(TAG, "日历数据已保存，共 %d 条", s_ctx.calendar_count);
 }
 
-/**
- * @brief 从 NVS 加载日历事件
- */
 static void nvs_load_calendars(void)
 {
     nvs_handle_t handle;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK)
-    {
         return;
-    }
-
     uint8_t count = 0;
     if (nvs_get_u8(handle, "cal_cnt", &count) == ESP_OK)
     {
@@ -276,32 +273,21 @@ static void nvs_load_calendars(void)
     nvs_close(handle);
 }
 
-/**
- * @brief 保存天气配置到 NVS
- */
 static void nvs_save_weather_config(void)
 {
     nvs_handle_t handle;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK)
-    {
         return;
-    }
     nvs_set_blob(handle, "weather_cfg", &s_ctx.weather_cfg, sizeof(weather_config_t));
     nvs_commit(handle);
     nvs_close(handle);
 }
 
-/**
- * @brief 从 NVS 加载天气配置，首次启动使用默认值
- */
 static void nvs_load_weather_config(void)
 {
     nvs_handle_t handle;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK)
-    {
         goto use_defaults;
-    }
-
     size_t len = sizeof(weather_config_t);
     if (nvs_get_blob(handle, "weather_cfg", &s_ctx.weather_cfg, &len) == ESP_OK)
     {
@@ -311,40 +297,26 @@ static void nvs_load_weather_config(void)
     nvs_close(handle);
 
 use_defaults:
-    /* 首次启动默认配置 */
     s_ctx.weather_cfg.schedule = WEATHER_SCHEDULE_MORNING;
     strncpy(s_ctx.weather_cfg.city_code, WEATHER_DEFAULT_CITY,
             sizeof(s_ctx.weather_cfg.city_code) - 1);
+    s_ctx.weather_cfg.city_code[sizeof(s_ctx.weather_cfg.city_code) - 1] = '\0'; /* [FIX-10] */
     strncpy(s_ctx.weather_cfg.city_name, "杭州",
             sizeof(s_ctx.weather_cfg.city_name) - 1);
+    s_ctx.weather_cfg.city_name[sizeof(s_ctx.weather_cfg.city_name) - 1] = '\0'; /* [FIX-10] */
 }
 
 /* ═══════════════════════════════════════════════════════════════════
  * 4. SNTP 时间同步
  * ═══════════════════════════════════════════════════════════════════ */
-
-/**
- * @brief SNTP 同步完成回调
- *
- * 同步成功后，系统时间有效，闹钟/日历/时间显示功能可用。
- */
 static void sntp_sync_notification_cb(struct timeval *tv)
 {
     ESP_LOGI(TAG, "SNTP 时间同步完成");
     s_ctx.sntp_synced = true;
 }
 
-/**
- * @brief 初始化时间来源
- *
- * MOCK 模式：直接 settimeofday 设置硬编码时间，立即置 sntp_synced=true，
- *           无需 WiFi，时钟从设定时刻开始正常走秒。
- * 正式模式：启动 SNTP 客户端，需在 WiFi got_ip 后调用；同步完成后
- *           通过 sntp_sync_notification_cb 置 sntp_synced=true。
- */
 static void sntp_time_sync_init(void)
 {
-    /* 时区设置两种模式都需要 */
     setenv("TZ", REMINDER_TZ, 1);
     tzset();
 
@@ -358,15 +330,14 @@ static void sntp_time_sync_init(void)
         .tm_sec = 0,
         .tm_isdst = -1,
     };
-    time_t t = mktime(&mock_tm);                     // mktime() 函数将 tm 结构转换为时间戳
-    struct timeval tv = {.tv_sec = t, .tv_usec = 0}; // 设置时间
+    time_t t = mktime(&mock_tm);
+    struct timeval tv = {.tv_sec = t, .tv_usec = 0};
     settimeofday(&tv, NULL);
     s_ctx.sntp_synced = true;
     ESP_LOGW(TAG, "演示模式：时间设为 %04d-%02d-%02d %02d:%02d（无 WiFi）",
              REMINDER_MOCK_YEAR, REMINDER_MOCK_MON, REMINDER_MOCK_DAY,
              REMINDER_MOCK_HOUR, REMINDER_MOCK_MIN);
 #else
-    /* 正式模式：启动 SNTP（需 WiFi 已就绪） */
     ESP_LOGI(TAG, "初始化 SNTP 时间同步... 时区=%s", REMINDER_TZ);
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "ntp.aliyun.com");
@@ -377,152 +348,95 @@ static void sntp_time_sync_init(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- todo5. 闹钟匹配与响铃控制
+ * 5. 闹钟匹配与响铃控制
  * ═══════════════════════════════════════════════════════════════════ */
-
-/**
- * @brief 判断闹钟是否应在当前时刻触发
- *
- * 检查规则：
- *   1. enabled == true
- *   2. 时、分精确匹配
- *   3. 根据重复模式检查星期几
- *
- * @param alarm   闹钟条目
- * @param now_tm  当前本地时间
- * @return true=应触发
- */
 static bool alarm_should_trigger(const alarm_entry_t *alarm, const struct tm *now_tm)
 {
-    //  *如果没有打开闹钟
-
     if (!alarm->enabled)
-    {
         return false;
-    }
-    // *系统的小时！=现在的小时 并且系统的分钟！=现在的分钟
     if (now_tm->tm_hour != alarm->hour || now_tm->tm_min != alarm->minute)
-    {
         return false;
-    }
 
-    int wday = now_tm->tm_wday; // 0=周日
-
-    switch (alarm->repeat) // 重复模式？
+    int wday = now_tm->tm_wday;
+    switch (alarm->repeat)
     {
-    case ALARM_REPEAT_ONCE:  // 单次
-    case ALARM_REPEAT_DAILY: // 每日
+    case ALARM_REPEAT_ONCE:
+    case ALARM_REPEAT_DAILY:
         return true;
-    case ALARM_REPEAT_WEEKDAY:           // 工作日重复（周一~周五）
-        return (wday >= 1 && wday <= 5); // 1~5为工作日
-    case ALARM_REPEAT_WEEKEND:           // 周末
+    case ALARM_REPEAT_WEEKDAY:
+        return (wday >= 1 && wday <= 5);
+    case ALARM_REPEAT_WEEKEND:
         return (wday == 0 || wday == 6);
-    case ALARM_REPEAT_CUSTOM: // 自定义？
+    case ALARM_REPEAT_CUSTOM:
         return (alarm->weekday_mask & (1 << wday)) != 0;
     default:
         return false;
     }
 }
 
-/**
- * @brief 闹钟响铃循环定时器回调（每 ALARM_RING_INTERVAL_MS 触发一次）
- *
- * 仅投递 REM_EVT_ALARM_RING_TICK 事件到队列，实际播报在 reminder_task 中执行。
- */
 static void ring_timer_callback(void *arg)
 {
-    reminder_evt_t evt = {
-        .type = REM_EVT_ALARM_RING_TICK,
-    };
-    xQueueSend(s_ctx.evt_queue, &evt, 0); // 发送事件到队列
+    reminder_evt_t evt = {.type = REM_EVT_ALARM_RING_TICK};
+    xQueueSend(s_ctx.evt_queue, &evt, 0);
 }
 
-/**
- * @brief 启动闹钟响铃循环
- *
- * 进入 RINGING 状态，创建周期定时器，每 5 秒重复播报。
- * 首次播报在调用时立即执行（不等定时器第一次触发）。
- *
- * @param alarm_id  触发的闹钟 ID
- * @param message   闹钟提醒内容
- */
 static void alarm_ring_start(uint8_t alarm_id, const char *message)
 {
-    s_ctx.state = REMINDER_STATE_RINGING; // 设置当前状态为响铃中
-    s_ctx.ringing_alarm_id = alarm_id;    // 保存当前正在响铃的闹钟 ID
-    s_ctx.ring_count = 0;                 // 先重置响铃计数器
+    s_ctx.state = REMINDER_STATE_RINGING;
+    s_ctx.ringing_alarm_id = alarm_id;
+    s_ctx.ring_count = 0;
 
     ESP_LOGW(TAG, "闹钟 #%d 开始响铃: %s", alarm_id, message);
 
-    /* 首次立即播报 */
     if (s_ctx.trigger_cb)
-    {
-        // 调用触发回调函数,闹钟，闹钟提醒内容？
-        s_ctx.trigger_cb(REMINDER_TYPE_ALARM, message, true); // 调用触发回调函数，参数为当前提醒类型、消息、是否首次播放
-    }
-    s_ctx.ring_count++; // 响铃计数器加1
+        s_ctx.trigger_cb(REMINDER_TYPE_ALARM, message, true);
+    s_ctx.ring_count++;
 
-    /* 启动响铃循环定时器 */
     if (s_ctx.ring_timer == NULL)
     {
         esp_timer_create_args_t args = {
             .callback = ring_timer_callback,
             .name = "alarm_ring",
         };
-        esp_err_t err = esp_timer_create(&args, &s_ctx.ring_timer); // 创建定时器，并且发送重复响铃事件到队列
+        esp_err_t err = esp_timer_create(&args, &s_ctx.ring_timer);
         if (err != ESP_OK)
         {
-            // ui_show_notification("Error", "Failed to create timer", 5000); //
-            ESP_LOGE(TAG, "time to create error: %s", esp_err_to_name(err)); // 打印错误信息，api含义是：创建定时器失败
+            /* [FIX-4] 定时器创建失败，回退到 IDLE 状态，避免永远卡在 RINGING */
+            ESP_LOGE(TAG, "响铃定时器创建失败: %s，回退到 IDLE", esp_err_to_name(err));
+            s_ctx.state = REMINDER_STATE_IDLE;
             return;
         }
     }
-    // 定时间为us级别，定时器间隔为ms，所以要乘1000
-    esp_timer_start_periodic(s_ctx.ring_timer, ALARM_RING_INTERVAL_MS * 1000); // 启动定时器，定时间隔为 ALARM_RING_INTERVAL_MS 毫秒
+    esp_timer_start_periodic(s_ctx.ring_timer, ALARM_RING_INTERVAL_MS * 1000);
 }
 
-/**
- * @brief 停止闹钟响铃，回到 IDLE 状态
- *
- * 停止循环定时器，清除 RINGING 状态。
- * 如果是一次性闹钟，自动禁用。
- */
 static void alarm_ring_stop(void)
 {
-    if (s_ctx.state != REMINDER_STATE_RINGING) // 状态不为响铃中
-    {
+    if (s_ctx.state != REMINDER_STATE_RINGING)
         return;
-    }
 
-    /* 停止响铃定时器 */
-    if (s_ctx.ring_timer) // 如果循环响铃
-    {
-        esp_timer_stop(s_ctx.ring_timer); // 停止循环响铃定时器
-    }
+    if (s_ctx.ring_timer)
+        esp_timer_stop(s_ctx.ring_timer);
 
     /* 一次性闹钟触发后自动禁用 */
-    xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);                           // 获取互斥锁，一直拥有？
-    if (s_ctx.ringing_alarm_id < s_ctx.alarm_count &&                     // 几个·闹钟·响铃的闹钟id少于闹钟数量？并且闹钟的模式为响铃一次
-        s_ctx.alarms[s_ctx.ringing_alarm_id].repeat == ALARM_REPEAT_ONCE) // 闹钟重复模式为一次
+    xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+    if (s_ctx.ringing_alarm_id < s_ctx.alarm_count &&
+        s_ctx.alarms[s_ctx.ringing_alarm_id].repeat == ALARM_REPEAT_ONCE)
     {
-        s_ctx.alarms[s_ctx.ringing_alarm_id].enabled = false; // 禁用该闹钟//
-        nvs_save_alarms();                                    // 保存闹钟到nvs？为什么禁用了还要保存？
+        s_ctx.alarms[s_ctx.ringing_alarm_id].enabled = false;
+        nvs_save_alarms();
         ESP_LOGI(TAG, "一次性闹钟 #%d 已自动禁用", s_ctx.ringing_alarm_id);
     }
     xSemaphoreGive(s_ctx.mutex);
 
-    s_ctx.state = REMINDER_STATE_IDLE; // 状态改为空闲
-    s_ctx.ring_count = 0;              // 响铃次数清零
+    s_ctx.state = REMINDER_STATE_IDLE;
+    s_ctx.ring_count = 0;
     ESP_LOGI(TAG, "闹钟响铃已停止");
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * 6. 天气获取（独立任务中执行，避免栈溢出）
+ * 6. 天气获取
  * ═══════════════════════════════════════════════════════════════════ */
-
-/**
- * @brief HTTP 响应缓冲区
- */
 typedef struct
 {
     char *buf;
@@ -530,9 +444,6 @@ typedef struct
     size_t capacity;
 } http_response_t;
 
-/**
- * @brief HTTP 事件回调 — 累积响应数据
- */
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
     http_response_t *resp = (http_response_t *)evt->user_data;
@@ -548,22 +459,6 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-/**
- * @brief 执行天气 API 请求并通过回调播报
- *
- * 在 reminder_task 上下文中执行（有足够栈空间）。
- *
- * API 接入说明（后续只需填入 WEATHER_API_KEY 和城市代码即可）：
- *   和风天气免费版 API：
- *     URL: https://devapi.qweather.com/v7/weather/now?location=<城市代码>&key=<API_KEY>
- *     返回 JSON 中 now.text = 天气描述, now.temp = 温度
- *
- *   心知天气 API：
- *     URL: https://api.seniverse.com/v3/weather/now.json?key=<KEY>&location=<城市>
- *     返回 JSON 中 results[0].now.text / results[0].now.temperature
- *
- * @return ESP_OK / ESP_FAIL
- */
 static esp_err_t weather_fetch_and_notify(void)
 {
     ESP_LOGI(TAG, "获取天气信息: %s (%s)",
@@ -576,7 +471,6 @@ static esp_err_t weather_fetch_and_notify(void)
         .capacity = sizeof(response_buf),
     };
 
-    /* 构建天气 API URL（修改 WEATHER_API_URL_FMT 和 WEATHER_API_KEY 即可接入） */
     char url[256];
     snprintf(url, sizeof(url), WEATHER_API_URL_FMT,
              s_ctx.weather_cfg.city_code, WEATHER_API_KEY);
@@ -605,29 +499,13 @@ static esp_err_t weather_fetch_and_notify(void)
     {
         ESP_LOGW(TAG, "天气 API 请求失败: err=%s, status=%d（使用占位消息）",
                  esp_err_to_name(err), status_code);
-        /*
-         * API 未接入时使用占位消息
-         * 接入后删除此分支，改用下方 JSON 解析结果
-         */
         snprintf(weather_msg, sizeof(weather_msg),
                  "现在为您播报%s的天气情况", s_ctx.weather_cfg.city_name);
     }
     else
     {
         ESP_LOGI(TAG, "天气 API 响应 (%d字节)", (int)resp.len);
-
-        /*
-         * ── JSON 解析逻辑（和风天气格式）──
-         *
-         * 响应格式：
-         *   { "code": "200", "now": { "temp": "25", "text": "晴" } }
-         *
-         * 接入步骤：
-         *   1. 在 reminder.h 中填入真实 WEATHER_API_KEY
-         *   2. 确认 WEATHER_DEFAULT_CITY 城市代码正确
-         *   3. 取消下方注释即可
-         */
-        /* ── 和风天气 JSON 解析（取消注释即用） ── */
+        /* API 接入后取消下方注释，删除占位 snprintf */
         /*
         cJSON *root = cJSON_Parse(resp.buf);
         if (root) {
@@ -649,152 +527,119 @@ static esp_err_t weather_fetch_and_notify(void)
                      "%s天气数据解析失败", s_ctx.weather_cfg.city_name);
         }
         */
-
-        /* 临时占位（API 接入后删除此行，启用上方解析） */
         snprintf(weather_msg, sizeof(weather_msg),
                  "现在为您播报%s的天气情况", s_ctx.weather_cfg.city_name);
     }
 
-    /* 通过回调通知上层播报 */
     if (s_ctx.trigger_cb)
-    {
         s_ctx.trigger_cb(REMINDER_TYPE_WEATHER, weather_msg, false);
-    }
     return ESP_OK;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * 7. 轮询定时器回调（1 秒心跳 — 仅做检测和事件投递）
+ * 7. 轮询定时器回调
  * ═══════════════════════════════════════════════════════════════════ */
-
-/**
- * @brief 1 秒轮询回调 — 提醒系统的心跳
- *
- * 在 esp_timer 任务上下文中执行（栈小，不可做耗时操作）。
- * 仅检测条件是否满足，满足则投递事件到 evt_queue，
- * 由 reminder_task 负责执行实际的播报/HTTP/震动操作。
- *
- * 检查顺序（体现优先级：闹钟 > 倒计时 > 日历 > 天气）：
- *   1. 闹钟到点？
- *   2. 倒计时到期？
- *   3. 日历事件匹配？
- *   4. 天气播报时段？
- *
- * 防重复机制：
- *   闹钟和日历使用 last_xxx_check_min 记录上次触发的分钟数，
- *   同一分钟内只触发一次，避免 60 次重复触发。
- */
 static void poll_timer_callback(void *arg)
 {
     reminder_evt_t evt = {0};
 
-    /* ── 倒计时检查（不依赖 SNTP，始终可用） ── */
+    /* ── 倒计时检查（不依赖 SNTP） ── */
     {
-        int64_t now_us = esp_timer_get_time(); // 当前时间（微秒）
+        int64_t now_us = esp_timer_get_time();
 
-        xSemaphoreTake(s_ctx.mutex, 0); // 非阻塞获取，失败则跳过本次
-        for (uint8_t i = 0; i < REMINDER_MAX_TIMERS; i++)
+        /* [FIX-3] 检查互斥锁获取结果，未持锁时跳过本轮检查 */
+        if (xSemaphoreTake(s_ctx.mutex, 0) == pdTRUE)
         {
-            timer_entry_t *t = &s_ctx.timers[i]; // 当前倒计时为 i 的倒计时
-            if (!t->active)                      // 没有倒计时
+            for (uint8_t i = 0; i < REMINDER_MAX_TIMERS; i++)
             {
-                continue; // 跳出
-            }
+                timer_entry_t *t = &s_ctx.timers[i];
+                if (!t->active)
+                    continue;
 
-            // 已过时间（微秒）/ 1 秒 = 已过时间（秒）
-            int64_t elapsed_sec = (now_us - t->start_time_us) / 1000000;
-            if (elapsed_sec >= (int64_t)t->duration_sec) // 大于总时长
-            {
-                /* 倒计时到期 → 投递事件 */
-                evt.type = REM_EVT_TIMER_EXPIRE;                            // 倒计时到期
-                evt.id = i;                                                 // 倒计时ID
-                strncpy(evt.message, t->message, REMINDER_MSG_MAX_LEN - 1); // 倒计时消息
-                t->active = false;                                          // 标记为已完成
-                xQueueSend(s_ctx.evt_queue, &evt, 0);                       // 发送事件
+                int64_t elapsed_sec = (now_us - t->start_time_us) / 1000000;
+                if (elapsed_sec >= (int64_t)t->duration_sec)
+                {
+                    evt.type = REM_EVT_TIMER_EXPIRE;
+                    evt.id = i;
+                    strncpy(evt.message, t->message, REMINDER_MSG_MAX_LEN - 1);
+                    evt.message[REMINDER_MSG_MAX_LEN - 1] = '\0'; /* [FIX-10] */
+                    t->active = false;
+                    xQueueSend(s_ctx.evt_queue, &evt, 0);
+                }
             }
+            xSemaphoreGive(s_ctx.mutex);
         }
-        xSemaphoreGive(s_ctx.mutex);
     }
 
-    /* SNTP 未同步时，闹钟/日历/天气无法工作 */
     if (!s_ctx.sntp_synced)
-    {
         return;
-    }
 
-    /* 闹钟正在响铃时，不检查新的提醒（闹钟优先级最高，独占） */
     if (s_ctx.state == REMINDER_STATE_RINGING)
-    {
         return;
-    }
 
-    time_t now = time(NULL);    // 获取当前时间
-    struct tm now_tm;           // 将时间戳转换为结构体
-    localtime_r(&now, &now_tm); // 获取当前时间
+    time_t now = time(NULL);
+    struct tm now_tm;
+    localtime_r(&now, &now_tm);
+    int current_min = now_tm.tm_hour * 60 + now_tm.tm_min;
 
-    int current_min = now_tm.tm_hour * 60 + now_tm.tm_min; // 将时间转换为分钟数
-
-    /*//! ──-------------- 闹钟检查（最高优先级） ── */
-    if (current_min != s_ctx.last_alarm_check_min) // 当前时间分钟数与上次检查时间不同
+    /* ── 闹钟检查（最高优先级） ── */
+    if (current_min != s_ctx.last_alarm_check_min)
     {
-        xSemaphoreTake(s_ctx.mutex, 0); // 获取互斥锁
-        for (uint8_t i = 0; i < s_ctx.alarm_count; i++)
+        /* [FIX-3] */
+        if (xSemaphoreTake(s_ctx.mutex, 0) == pdTRUE)
         {
-            if (alarm_should_trigger(&s_ctx.alarms[i], &now_tm)) // 判断当前闹钟是否应该触发
+            for (uint8_t i = 0; i < s_ctx.alarm_count; i++)
             {
-                // 构造触发事件
-                evt.type = REM_EVT_ALARM_TRIGGER; // 触发事件类型，闹钟到点
-                evt.id = i;                       // 闹钟 ID
-                // 复制闹钟消息，参数1：目标字符串，参数2：源字符串，参数3：最大长度
-                strncpy(evt.message, s_ctx.alarms[i].message, REMINDER_MSG_MAX_LEN - 1);
-                // 发送到事件队列
-                xQueueSend(s_ctx.evt_queue, &evt, 0);
-                // 更新最后检查时间
-                s_ctx.last_alarm_check_min = current_min;
-                // 释放锁并立即返回
-                xSemaphoreGive(s_ctx.mutex);
-                return; // ⚠️ 关键：闹钟最高优先级！
+                if (alarm_should_trigger(&s_ctx.alarms[i], &now_tm))
+                {
+                    evt.type = REM_EVT_ALARM_TRIGGER;
+                    evt.id = i;
+                    strncpy(evt.message, s_ctx.alarms[i].message, REMINDER_MSG_MAX_LEN - 1);
+                    evt.message[REMINDER_MSG_MAX_LEN - 1] = '\0'; /* [FIX-10] */
+                    xQueueSend(s_ctx.evt_queue, &evt, 0);
+                    s_ctx.last_alarm_check_min = current_min;
+                    xSemaphoreGive(s_ctx.mutex);
+                    return;
+                }
             }
+            xSemaphoreGive(s_ctx.mutex);
         }
-        xSemaphoreGive(s_ctx.mutex);
     }
 
     /* ── 日历事件检查 ── */
     if (current_min != s_ctx.last_cal_check_min)
     {
-        xSemaphoreTake(s_ctx.mutex, 0);
-        for (uint8_t i = 0; i < s_ctx.calendar_count; i++)
+        /* [FIX-3] */
+        if (xSemaphoreTake(s_ctx.mutex, 0) == pdTRUE)
         {
-            calendar_entry_t *cal = &s_ctx.calendars[i];
-            if (!cal->enabled)
+            for (uint8_t i = 0; i < s_ctx.calendar_count; i++)
             {
-                continue;
+                calendar_entry_t *cal = &s_ctx.calendars[i];
+                if (!cal->enabled)
+                    continue;
+                if (cal->year == (uint16_t)(now_tm.tm_year + 1900) &&
+                    cal->month == (uint8_t)(now_tm.tm_mon + 1) &&
+                    cal->day == (uint8_t)now_tm.tm_mday &&
+                    cal->hour == (uint8_t)now_tm.tm_hour &&
+                    cal->minute == (uint8_t)now_tm.tm_min)
+                {
+                    evt.type = REM_EVT_CALENDAR_TRIGGER;
+                    evt.id = i;
+                    strncpy(evt.message, cal->message, REMINDER_MSG_MAX_LEN - 1);
+                    evt.message[REMINDER_MSG_MAX_LEN - 1] = '\0'; /* [FIX-10] */
+                    xQueueSend(s_ctx.evt_queue, &evt, 0);
+                    cal->enabled = false;
+                    s_ctx.last_cal_check_min = current_min;
+                }
             }
-            if (cal->year == (uint16_t)(now_tm.tm_year + 1900) &&
-                cal->month == (uint8_t)(now_tm.tm_mon + 1) &&
-                cal->day == (uint8_t)now_tm.tm_mday &&
-                cal->hour == (uint8_t)now_tm.tm_hour &&
-                cal->minute == (uint8_t)now_tm.tm_min)
-            {
-
-                evt.type = REM_EVT_CALENDAR_TRIGGER;
-                evt.id = i;
-                strncpy(evt.message, cal->message, REMINDER_MSG_MAX_LEN - 1);
-                xQueueSend(s_ctx.evt_queue, &evt, 0);
-
-                cal->enabled = false; // 日历事件为一次性
-                s_ctx.last_cal_check_min = current_min;
-            }
+            xSemaphoreGive(s_ctx.mutex);
         }
-        xSemaphoreGive(s_ctx.mutex);
     }
 
     /* ── 天气播报检查（最低优先级） ── */
     if (s_ctx.weather_cfg.schedule != WEATHER_SCHEDULE_DISABLED &&
         s_ctx.state == REMINDER_STATE_IDLE)
     {
-
-        /* 跨日重置 */
         if (now_tm.tm_mday != s_ctx.last_weather_day)
         {
             s_ctx.weather_morning_done = false;
@@ -804,7 +649,6 @@ static void poll_timer_callback(void *arg)
 
         bool should_fetch = false;
 
-        /* 早间（去重靠 weather_morning_done，跨日重置；不与日历共享 last_*_min） */
         if ((s_ctx.weather_cfg.schedule == WEATHER_SCHEDULE_MORNING ||
              s_ctx.weather_cfg.schedule == WEATHER_SCHEDULE_BOTH) &&
             !s_ctx.weather_morning_done &&
@@ -815,7 +659,6 @@ static void poll_timer_callback(void *arg)
             s_ctx.weather_morning_done = true;
         }
 
-        /* 晚间 */
         if ((s_ctx.weather_cfg.schedule == WEATHER_SCHEDULE_EVENING ||
              s_ctx.weather_cfg.schedule == WEATHER_SCHEDULE_BOTH) &&
             !s_ctx.weather_evening_done &&
@@ -835,57 +678,32 @@ static void poll_timer_callback(void *arg)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * 8. 提醒任务（所有耗时操作在此执行）
+ * 8. 提醒任务
  * ═══════════════════════════════════════════════════════════════════ */
-
-/**
- * @brief 提醒系统主任务
- *
- * 从事件队列中读取事件，执行对应操作：
- *   - ALARM_TRIGGER：启动响铃循环
- *   - ALARM_RING_TICK：重复播报（超时检查）
- *   - ALARM_DISMISS：停止响铃
- *   - ALARM_SNOOZE：停止当前响铃，创建延迟倒计时
- *   - TIMER_EXPIRE：播报倒计时到期
- *   - CALENDAR_TRIGGER：播报日历事件
- *   - WEATHER_FETCH：HTTP 请求天气并播报
- *
- * @param arg 未使用
- */
 static void reminder_task(void *arg)
 {
     reminder_evt_t evt;
-
     ESP_LOGI(TAG, "提醒任务启动");
 
     while (1)
     {
-        /* 阻塞等待事件（无超时，省电）如果队列为空，则进入休眠状态 */
-        if (xQueueReceive(s_ctx.evt_queue, &evt, portMAX_DELAY) != pdTRUE) // 参数1：队列，参数2：接收到的数据，参数3：阻塞时间
-        {
-            continue; // 跳过循环
-        }
+        if (xQueueReceive(s_ctx.evt_queue, &evt, portMAX_DELAY) != pdTRUE)
+            continue;
 
         switch (evt.type)
         {
-
-        /* ── -------------------------------------------闹钟触发 ── */
         case REM_EVT_ALARM_TRIGGER:
             ESP_LOGW(TAG, ">>> 闹钟 #%d 触发: %s <<<", evt.id, evt.message);
-            alarm_ring_start(evt.id, evt.message); // todo重复响铃函数：闹钟id，播放？？
+            alarm_ring_start(evt.id, evt.message);
             break;
 
-        /* ── 闹钟响铃循环（每 5 秒） ── */
         case REM_EVT_ALARM_RING_TICK:
-            if (s_ctx.state != REMINDER_STATE_RINGING) // 如果当前状态不在响铃状态？
-            {
-                break; // 已被关闭，忽略残留事件
-            }
+            if (s_ctx.state != REMINDER_STATE_RINGING)
+                break;
 
-            s_ctx.ring_count++; // 响铃计数器加1
+            s_ctx.ring_count++;
 
-            /* 超时自动关闭 */
-            if (s_ctx.ring_count >= ALARM_RING_MAX_COUNT) // 响铃60s钟后自动关闭
+            if (s_ctx.ring_count >= ALARM_RING_MAX_COUNT)
             {
                 ESP_LOGW(TAG, "闹钟 #%d 响铃超时（%d 次），自动关闭",
                          s_ctx.ringing_alarm_id, s_ctx.ring_count);
@@ -893,64 +711,55 @@ static void reminder_task(void *arg)
                 break;
             }
 
-            /* 重复播报 */
             ESP_LOGI(TAG, "闹钟 #%d 第 %d 次响铃",
                      s_ctx.ringing_alarm_id, s_ctx.ring_count);
-            if (s_ctx.trigger_cb) // 如果触发了回调
+            if (s_ctx.trigger_cb)
             {
                 xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
-                if (s_ctx.ringing_alarm_id < s_ctx.alarm_count) // 闹钟id少于闹钟数量
-                {
-                    // 触发回调：提醒类型、提醒id、提醒内容，参数1：闹钟id、参数2：提醒内容，闹钟数据里面的第几个闹钟的闹钟提醒数据打开闹钟
-                    s_ctx.trigger_cb(REMINDER_TYPE_ALARM, s_ctx.alarms[s_ctx.ringing_alarm_id].message, true);
-                }
+                if (s_ctx.ringing_alarm_id < s_ctx.alarm_count)
+                    s_ctx.trigger_cb(REMINDER_TYPE_ALARM,
+                                     s_ctx.alarms[s_ctx.ringing_alarm_id].message, true);
                 xSemaphoreGive(s_ctx.mutex);
             }
             break;
 
-        /* ── 用户关闭闹钟 ── */
         case REM_EVT_ALARM_DISMISS:
             ESP_LOGI(TAG, "用户关闭闹钟");
             alarm_ring_stop();
-            /* 通知上层"闹钟已关闭"（可选播报） */
             if (s_ctx.trigger_cb)
-            {
                 s_ctx.trigger_cb(REMINDER_TYPE_ALARM, "闹钟已关闭", false);
-            }
             break;
 
-        /* ── 倒计时到期 ── */
-        case REM_EVT_TIMER_EXPIRE: // 第几个倒计时，倒计时播放的内容
+        case REM_EVT_TIMER_EXPIRE:
             ESP_LOGI(TAG, "倒计时 #%d 到期: %s", evt.id, evt.message);
-            s_ctx.state = REMINDER_STATE_NOTIFYING; // 状态设置为播放中
+            s_ctx.state = REMINDER_STATE_NOTIFYING;
             if (s_ctx.trigger_cb)
-            {
-                // 触发回调，倒计时到期，提醒内容？关闭倒计时
                 s_ctx.trigger_cb(REMINDER_TYPE_TIMER, evt.message, false);
-            }
-            s_ctx.state = REMINDER_STATE_IDLE; // 更改状态
+            s_ctx.state = REMINDER_STATE_IDLE;
             break;
 
-        /* ── 日历事件触发 ── */
         case REM_EVT_CALENDAR_TRIGGER:
             ESP_LOGI(TAG, "日历事件 #%d 触发: %s", evt.id, evt.message);
             s_ctx.state = REMINDER_STATE_NOTIFYING;
             if (s_ctx.trigger_cb)
-            {
                 s_ctx.trigger_cb(REMINDER_TYPE_CALENDAR, evt.message, false);
-            }
-            /* 持久化已禁用的日历事件 */
-            nvs_save_calendars();
+            nvs_save_calendars(); /* 已改为异步队列 [FIX-5] */
             s_ctx.state = REMINDER_STATE_IDLE;
             break;
 
-        /* ── 天气播报 ── */
         case REM_EVT_WEATHER_FETCH:
             ESP_LOGI(TAG, "执行天气播报");
             s_ctx.state = REMINDER_STATE_NOTIFYING;
             weather_fetch_and_notify();
             s_ctx.state = REMINDER_STATE_IDLE;
             break;
+
+        /* [FIX-7] 安全关闭：收到 SHUTDOWN 信号后自删除 */
+        case REM_EVT_SHUTDOWN:
+            ESP_LOGI(TAG, "提醒任务收到关闭信号，退出");
+            s_ctx.task_handle = NULL;
+            vTaskDelete(NULL);
+            return; /* 不可达，防御性写法 */
 
         default:
             ESP_LOGW(TAG, "未知事件类型: %d", evt.type);
@@ -960,9 +769,8 @@ static void reminder_task(void *arg)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * 9. 对外接口 — 系统生命周期
+ * 9. 系统生命周期
  * ═══════════════════════════════════════════════════════════════════ */
-
 esp_err_t reminder_init(reminder_trigger_cb_t cb)
 {
     if (s_ctx.initialized)
@@ -970,13 +778,30 @@ esp_err_t reminder_init(reminder_trigger_cb_t cb)
         ESP_LOGW(TAG, "提醒系统已初始化，跳过");
         return ESP_OK;
     }
-    ESP_LOGI(TAG, "初始化提醒系统...");
-    memset(&s_ctx, 0, sizeof(s_ctx)); // 清空提醒系统上下文
-    s_ctx.trigger_cb = cb;            // 设置提醒触发回调
-    s_ctx.last_alarm_check_min = -1;  // 设置上一次检查闹钟的分钟数
-    s_ctx.last_cal_check_min = -1;    // 设置上最后一次检查日历的分钟数
 
-    /* 创建互斥锁 */
+    /* [FIX-8] 清理上次 init 失败遗留的资源（防二次调用泄漏） */
+    if (s_ctx.mutex)
+    {
+        vSemaphoreDelete(s_ctx.mutex);
+        s_ctx.mutex = NULL;
+    }
+    if (s_ctx.evt_queue)
+    {
+        vQueueDelete(s_ctx.evt_queue);
+        s_ctx.evt_queue = NULL;
+    }
+    if (s_save_queue)
+    {
+        vQueueDelete(s_save_queue);
+        s_save_queue = NULL;
+    }
+
+    ESP_LOGI(TAG, "初始化提醒系统...");
+    memset(&s_ctx, 0, sizeof(s_ctx));
+    s_ctx.trigger_cb = cb;
+    s_ctx.last_alarm_check_min = -1;
+    s_ctx.last_cal_check_min = -1;
+
     s_ctx.mutex = xSemaphoreCreateMutex();
     if (s_ctx.mutex == NULL)
     {
@@ -984,48 +809,69 @@ esp_err_t reminder_init(reminder_trigger_cb_t cb)
         return ESP_FAIL;
     }
 
-    /* 创建事件队列（容量 10，足够缓冲突发事件） */
     s_ctx.evt_queue = xQueueCreate(10, sizeof(reminder_evt_t));
     if (s_ctx.evt_queue == NULL)
     {
         ESP_LOGE(TAG, "事件队列创建失败");
         vSemaphoreDelete(s_ctx.mutex);
+        s_ctx.mutex = NULL;
         return ESP_FAIL;
     }
 
-    /* 从 NVS 加载持久化数据 */
-    nvs_load_alarms();         // 载入闹钟数据
-    nvs_load_calendars();      // 载入日历数据
-    nvs_load_weather_config(); // 载入天气数据
+    s_save_queue = xQueueCreate(4, sizeof(uint8_t));
+    if (s_save_queue == NULL)
+    {
+        ESP_LOGE(TAG, "NVS 保存队列创建失败");
+        vQueueDelete(s_ctx.evt_queue);
+        s_ctx.evt_queue = NULL;
+        vSemaphoreDelete(s_ctx.mutex);
+        s_ctx.mutex = NULL;
+        return ESP_FAIL;
+    }
+    {
+        BaseType_t r = xTaskCreate(nvs_save_task, "nvs_save", 4096, NULL, 1, NULL);
+        if (r != pdPASS)
+        {
+            ESP_LOGE(TAG, "NVS 保存任务创建失败");
+            vQueueDelete(s_save_queue);
+            s_save_queue = NULL;
+            vQueueDelete(s_ctx.evt_queue);
+            s_ctx.evt_queue = NULL;
+            vSemaphoreDelete(s_ctx.mutex);
+            s_ctx.mutex = NULL;
+            return ESP_FAIL;
+        }
+    }
+
+    nvs_load_alarms();
+    nvs_load_calendars();
+    nvs_load_weather_config();
 
 #ifdef REMINDER_MOCK_TIME
-    /* 演示模式：直接在此处设置模拟时间，无需等 WiFi */
     sntp_time_sync_init();
-#else
-    /* 正式模式：SNTP 需 WiFi 就绪后调用；请在 IP_EVENT_STA_GOT_IP 事件里调用
-     * reminder_sntp_start()，或直接调用 sntp_time_sync_init()。 */
 #endif
 
-    /* 创建提醒任务（栈分配在 SPIRAM，节省内部 SRAM） */
+    /* [FIX-11] 栈从 8KB 增大到 12KB，天气 HTTP 需要 ~2.4KB */
     BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
-        reminder_task,      // 任务函数
-        "reminder_task",    // 任务名称
-        8192,               // 栈大小：8KB
-        NULL,               // 任务参数
-        2,                  // 优先级：2（低于 LVGL=3、音频=5；HTTP 拉天气时不会卡 UI 渲染）
-        &s_ctx.task_handle, // 任务句柄
-        0,                  // 绑定核心：CPU0
-        MALLOC_CAP_SPIRAM); // 栈内存来源：外部 SPIRAM
+        reminder_task, "reminder_task", 12288,
+        NULL, 2, &s_ctx.task_handle, 0, MALLOC_CAP_SPIRAM);
 
     if (ret != pdPASS)
     {
         ESP_LOGE(TAG, "提醒任务创建失败");
+        /* [FIX-8] 完整清理：包括 NVS 任务 */
+        uint8_t exit_cmd = NVS_SAVE_CMD_EXIT;
+        xQueueSend(s_save_queue, &exit_cmd, 0);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        vQueueDelete(s_save_queue);
+        s_save_queue = NULL;
         vQueueDelete(s_ctx.evt_queue);
+        s_ctx.evt_queue = NULL;
         vSemaphoreDelete(s_ctx.mutex);
+        s_ctx.mutex = NULL;
         return ESP_FAIL;
     }
 
-    /* 创建并启动 1 秒轮询定时器 */
     esp_timer_create_args_t timer_args = {
         .callback = poll_timer_callback,
         .name = "reminder_poll",
@@ -1033,10 +879,23 @@ esp_err_t reminder_init(reminder_trigger_cb_t cb)
     esp_err_t err = esp_timer_create(&timer_args, &s_ctx.poll_timer);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "轮询定时器创建失败");
+        ESP_LOGE(TAG, "轮询定时器创建失败: %s", esp_err_to_name(err));
+        /* [FIX-8] 完整清理 */
+        reminder_evt_t shutdown_evt = {.type = REM_EVT_SHUTDOWN};
+        xQueueSend(s_ctx.evt_queue, &shutdown_evt, pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(500));
+        uint8_t exit_cmd = NVS_SAVE_CMD_EXIT;
+        xQueueSend(s_save_queue, &exit_cmd, 0);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        vQueueDelete(s_save_queue);
+        s_save_queue = NULL;
+        vQueueDelete(s_ctx.evt_queue);
+        s_ctx.evt_queue = NULL;
+        vSemaphoreDelete(s_ctx.mutex);
+        s_ctx.mutex = NULL;
         return err;
     }
-    esp_timer_start_periodic(s_ctx.poll_timer, 1000000); // 1 秒
+    esp_timer_start_periodic(s_ctx.poll_timer, 1000000);
 
     s_ctx.initialized = true;
     ESP_LOGI(TAG, "提醒系统初始化完成");
@@ -1046,35 +905,72 @@ esp_err_t reminder_init(reminder_trigger_cb_t cb)
 void reminder_deinit(void)
 {
     if (!s_ctx.initialized)
-    {
         return;
-    }
 
+    /* 1. 停止定时器 — 不再产生新事件 */
     if (s_ctx.poll_timer)
     {
         esp_timer_stop(s_ctx.poll_timer);
         esp_timer_delete(s_ctx.poll_timer);
+        s_ctx.poll_timer = NULL;
     }
     if (s_ctx.ring_timer)
     {
         esp_timer_stop(s_ctx.ring_timer);
         esp_timer_delete(s_ctx.ring_timer);
+        s_ctx.ring_timer = NULL;
     }
-    if (s_ctx.task_handle)
+
+    /* 2. [FIX-9] 安全关闭 NVS 保存任务 */
+    if (s_save_queue)
     {
-        vTaskDelete(s_ctx.task_handle);
+        uint8_t exit_cmd = NVS_SAVE_CMD_EXIT;
+        xQueueSend(s_save_queue, &exit_cmd, pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(300)); /* 等待任务自行退出 */
     }
+
+    /* 3. [FIX-9] 安全关闭 reminder_task：发送 SHUTDOWN 信号并等待 */
+    if (s_ctx.task_handle && s_ctx.evt_queue)
+    {
+        reminder_evt_t shutdown_evt = {.type = REM_EVT_SHUTDOWN};
+        xQueueSend(s_ctx.evt_queue, &shutdown_evt, pdMS_TO_TICKS(100));
+
+        /* 等待任务自行退出（最多 5 秒，覆盖 HTTP 超时） */
+        for (int i = 0; i < 50; i++)
+        {
+            if (s_ctx.task_handle == NULL)
+                break; /* 任务已自删除，句柄被清零 */
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        /* 如果仍未退出，强制删除 */
+        if (s_ctx.task_handle != NULL)
+        {
+            ESP_LOGW(TAG, "提醒任务未响应关闭信号，强制删除");
+            vTaskDelete(s_ctx.task_handle);
+            s_ctx.task_handle = NULL;
+        }
+    }
+
+    /* 4. 释放队列和互斥锁 */
     if (s_ctx.evt_queue)
     {
         vQueueDelete(s_ctx.evt_queue);
+        s_ctx.evt_queue = NULL;
+    }
+    if (s_save_queue)
+    {
+        vQueueDelete(s_save_queue);
+        s_save_queue = NULL;
     }
     if (s_ctx.mutex)
     {
         vSemaphoreDelete(s_ctx.mutex);
+        s_ctx.mutex = NULL;
     }
 
 #ifndef REMINDER_MOCK_TIME
-    esp_sntp_stop(); // 演示模式未启动 SNTP，跳过
+    esp_sntp_stop();
 #endif
     s_ctx.initialized = false;
     ESP_LOGI(TAG, "提醒系统已销毁");
@@ -1092,8 +988,6 @@ bool reminder_is_time_synced(void)
 
 bool reminder_get_current_time(uint8_t *hour, uint8_t *minute, uint8_t *second)
 {
-    /* SNTP 未同步时不要返回 time(NULL) 的值（会得到 1970 年起的偏移，
-       东八区会显示 08:00 这种假时间）。返回 0 让 UI 显示占位符。 */
     if (!s_ctx.sntp_synced)
     {
         if (hour)
@@ -1121,13 +1015,10 @@ bool reminder_get_current_time(uint8_t *hour, uint8_t *minute, uint8_t *second)
 /* ═══════════════════════════════════════════════════════════════════
  * 10. 对外接口 — 闹钟
  * ═══════════════════════════════════════════════════════════════════ */
-
 int reminder_alarm_add(const alarm_entry_t *entry)
 {
     if (entry == NULL)
-    {
         return -1;
-    }
 
     xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
 
@@ -1141,38 +1032,40 @@ int reminder_alarm_add(const alarm_entry_t *entry)
     uint8_t new_id = s_ctx.alarm_count;
     s_ctx.alarms[new_id] = *entry;
     s_ctx.alarms[new_id].id = new_id;
-    s_ctx.alarms[new_id].enabled = true;
+    /* [FIX-12] 不强制 enabled=true，由调用方决定 */
     s_ctx.alarm_count++;
 
     nvs_save_alarms();
     xSemaphoreGive(s_ctx.mutex);
 
-    ESP_LOGI(TAG, "添加闹钟 #%d: %02d:%02d [%s]",
-             new_id, entry->hour, entry->minute, entry->message);
+    ESP_LOGI(TAG, "添加闹钟 #%d: %02d:%02d [enabled=%d]",
+             new_id, entry->hour, entry->minute, entry->enabled);
     return new_id;
 }
 
 esp_err_t reminder_alarm_delete(uint8_t alarm_id)
 {
     xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
-
     if (alarm_id >= s_ctx.alarm_count)
     {
         xSemaphoreGive(s_ctx.mutex);
         return ESP_ERR_NOT_FOUND;
     }
 
-    /* 前移覆盖 */
+#if REMINDER_MAX_ALARMS > 1
+    /* 多闹钟：前移覆盖 */
     for (uint8_t i = alarm_id; i < s_ctx.alarm_count - 1; i++)
     {
         s_ctx.alarms[i] = s_ctx.alarms[i + 1];
         s_ctx.alarms[i].id = i;
     }
+#else
+    /* 单闹钟：直接清零，无数组移位 */
+    memset(&s_ctx.alarms[0], 0, sizeof(alarm_entry_t));
+#endif
     s_ctx.alarm_count--;
-
     nvs_save_alarms();
     xSemaphoreGive(s_ctx.mutex);
-
     ESP_LOGI(TAG, "删除闹钟 #%d", alarm_id);
     return ESP_OK;
 }
@@ -1180,27 +1073,24 @@ esp_err_t reminder_alarm_delete(uint8_t alarm_id)
 esp_err_t reminder_alarm_set_enabled(uint8_t alarm_id, bool enabled)
 {
     xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
-
     if (alarm_id >= s_ctx.alarm_count)
     {
         xSemaphoreGive(s_ctx.mutex);
         return ESP_ERR_NOT_FOUND;
     }
-
     s_ctx.alarms[alarm_id].enabled = enabled;
     nvs_save_alarms();
     xSemaphoreGive(s_ctx.mutex);
-
     ESP_LOGI(TAG, "闹钟 #%d %s", alarm_id, enabled ? "启用" : "禁用");
     return ESP_OK;
 }
+
 esp_err_t reminder_alarm_update(uint8_t alarm_id, const alarm_entry_t *entry)
 {
     if (entry == NULL)
         return ESP_ERR_INVALID_ARG;
 
     xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
-
     if (alarm_id >= s_ctx.alarm_count)
     {
         xSemaphoreGive(s_ctx.mutex);
@@ -1209,13 +1099,14 @@ esp_err_t reminder_alarm_update(uint8_t alarm_id, const alarm_entry_t *entry)
 
     alarm_entry_t updated = *entry;
     updated.id = alarm_id;
-    updated.enabled = true;
+    /* [FIX-12] 不强制 enabled=true，保留调用方传入的开关状态 */
     s_ctx.alarms[alarm_id] = updated;
 
     nvs_save_alarms();
     xSemaphoreGive(s_ctx.mutex);
 
-    ESP_LOGI(TAG, "更新闹钟 #%d: %02d:%02d", alarm_id, updated.hour, updated.minute);
+    ESP_LOGI(TAG, "更新闹钟 #%d: %02d:%02d [enabled=%d]",
+             alarm_id, updated.hour, updated.minute, updated.enabled);
     return ESP_OK;
 }
 
@@ -1223,13 +1114,9 @@ void reminder_alarm_get_all(alarm_entry_t *out_list, uint8_t *out_count)
 {
     xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
     if (out_list)
-    {
         memcpy(out_list, s_ctx.alarms, sizeof(alarm_entry_t) * s_ctx.alarm_count);
-    }
     if (out_count)
-    {
         *out_count = s_ctx.alarm_count;
-    }
     xSemaphoreGive(s_ctx.mutex);
 }
 
@@ -1240,10 +1127,7 @@ esp_err_t reminder_alarm_dismiss(void)
         ESP_LOGW(TAG, "当前无响铃闹钟，忽略关闭指令");
         return ESP_ERR_NOT_FOUND;
     }
-
-    reminder_evt_t evt = {
-        .type = REM_EVT_ALARM_DISMISS,
-    };
+    reminder_evt_t evt = {.type = REM_EVT_ALARM_DISMISS};
     xQueueSend(s_ctx.evt_queue, &evt, pdMS_TO_TICKS(100));
     return ESP_OK;
 }
@@ -1251,7 +1135,6 @@ esp_err_t reminder_alarm_dismiss(void)
 /* ═══════════════════════════════════════════════════════════════════
  * 11. 对外接口 — 倒计时
  * ═══════════════════════════════════════════════════════════════════ */
-
 int reminder_timer_start(uint32_t duration_sec, const char *message)
 {
     xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
@@ -1265,7 +1148,6 @@ int reminder_timer_start(uint32_t duration_sec, const char *message)
             break;
         }
     }
-
     if (slot < 0)
     {
         ESP_LOGW(TAG, "倒计时已满 (%d)", REMINDER_MAX_TIMERS);
@@ -1280,6 +1162,7 @@ int reminder_timer_start(uint32_t duration_sec, const char *message)
     strncpy(s_ctx.timers[slot].message,
             message ? message : "倒计时到了",
             REMINDER_MSG_MAX_LEN - 1);
+    s_ctx.timers[slot].message[REMINDER_MSG_MAX_LEN - 1] = '\0'; /* [FIX-10] */
 
     xSemaphoreGive(s_ctx.mutex);
 
@@ -1291,9 +1174,7 @@ int reminder_timer_start(uint32_t duration_sec, const char *message)
 esp_err_t reminder_timer_cancel(uint8_t timer_id)
 {
     if (timer_id >= REMINDER_MAX_TIMERS)
-    {
         return ESP_ERR_NOT_FOUND;
-    }
 
     xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
     if (!s_ctx.timers[timer_id].active)
@@ -1311,9 +1192,7 @@ esp_err_t reminder_timer_cancel(uint8_t timer_id)
 esp_err_t reminder_timer_get_remain(uint8_t timer_id, uint32_t *out_remain)
 {
     if (timer_id >= REMINDER_MAX_TIMERS || out_remain == NULL)
-    {
         return ESP_ERR_INVALID_ARG;
-    }
 
     xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
     if (!s_ctx.timers[timer_id].active)
@@ -1321,11 +1200,9 @@ esp_err_t reminder_timer_get_remain(uint8_t timer_id, uint32_t *out_remain)
         xSemaphoreGive(s_ctx.mutex);
         return ESP_ERR_NOT_FOUND;
     }
-
     int64_t elapsed = (esp_timer_get_time() - s_ctx.timers[timer_id].start_time_us) / 1000000;
     int64_t remain = (int64_t)s_ctx.timers[timer_id].duration_sec - elapsed;
     *out_remain = (remain > 0) ? (uint32_t)remain : 0;
-
     xSemaphoreGive(s_ctx.mutex);
     return ESP_OK;
 }
@@ -1333,16 +1210,12 @@ esp_err_t reminder_timer_get_remain(uint8_t timer_id, uint32_t *out_remain)
 /* ═══════════════════════════════════════════════════════════════════
  * 12. 对外接口 — 日历
  * ═══════════════════════════════════════════════════════════════════ */
-
 int reminder_calendar_add(const calendar_entry_t *entry)
 {
     if (entry == NULL)
-    {
         return -1;
-    }
 
     xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
-
     if (s_ctx.calendar_count >= REMINDER_MAX_CALENDARS)
     {
         ESP_LOGW(TAG, "日历事件已满 (%d)", REMINDER_MAX_CALENDARS);
@@ -1356,7 +1229,7 @@ int reminder_calendar_add(const calendar_entry_t *entry)
     s_ctx.calendars[new_id].enabled = true;
     s_ctx.calendar_count++;
 
-    nvs_save_calendars();
+    nvs_save_calendars(); /* [FIX-5] 已改为异步 */
     xSemaphoreGive(s_ctx.mutex);
 
     ESP_LOGI(TAG, "添加日历事件 #%d: %04d-%02d-%02d %02d:%02d [%s]",
@@ -1368,23 +1241,19 @@ int reminder_calendar_add(const calendar_entry_t *entry)
 esp_err_t reminder_calendar_delete(uint8_t cal_id)
 {
     xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
-
     if (cal_id >= s_ctx.calendar_count)
     {
         xSemaphoreGive(s_ctx.mutex);
         return ESP_ERR_NOT_FOUND;
     }
-
     for (uint8_t i = cal_id; i < s_ctx.calendar_count - 1; i++)
     {
         s_ctx.calendars[i] = s_ctx.calendars[i + 1];
         s_ctx.calendars[i].id = i;
     }
     s_ctx.calendar_count--;
-
-    nvs_save_calendars();
+    nvs_save_calendars(); /* [FIX-5] 已改为异步 */
     xSemaphoreGive(s_ctx.mutex);
-
     ESP_LOGI(TAG, "删除日历事件 #%d", cal_id);
     return ESP_OK;
 }
@@ -1413,9 +1282,7 @@ void reminder_calendar_get_today(calendar_entry_t *out_list, uint8_t *out_count)
             cal->day == (uint8_t)now_tm.tm_mday)
         {
             if (out_list)
-            {
                 out_list[count] = *cal;
-            }
             count++;
         }
     }
@@ -1428,13 +1295,10 @@ void reminder_calendar_get_today(calendar_entry_t *out_list, uint8_t *out_count)
 /* ═══════════════════════════════════════════════════════════════════
  * 13. 对外接口 — 天气
  * ═══════════════════════════════════════════════════════════════════ */
-
 esp_err_t reminder_weather_config(const weather_config_t *config)
 {
     if (config == NULL)
-    {
         return ESP_ERR_INVALID_ARG;
-    }
 
     xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
     s_ctx.weather_cfg = *config;
@@ -1450,9 +1314,7 @@ esp_err_t reminder_weather_config(const weather_config_t *config)
 
 esp_err_t reminder_weather_fetch_now(void)
 {
-    reminder_evt_t evt = {
-        .type = REM_EVT_WEATHER_FETCH,
-    };
+    reminder_evt_t evt = {.type = REM_EVT_WEATHER_FETCH};
     return xQueueSend(s_ctx.evt_queue, &evt, pdMS_TO_TICKS(100)) == pdTRUE
                ? ESP_OK
                : ESP_FAIL;

@@ -41,8 +41,8 @@
 
 #define BSP_TOUCH_1_PIN 1     ///< 触摸铜箔 1（对应 ESP32-S3 TOUCH1 通道）头部
 #define BSP_TOUCH_2_PIN 2     ///< 触摸铜箔 2（对应 ESP32-S3 TOUCH2 通道）背部
-#define BSP_TOUCH_3_PIN 7     ///< 触摸铜箔 3（对应 ESP32-S3 TOUCH7 通道）腹部
-#define BSP_TOUCH_PREV_PIN 3  ///< 翻页前一页触摸（对应 ESP32-S3 TOUCH3 通道）GPIO3 空闲
+#define BSP_TOUCH_3_PIN 3     ///< 触摸铜箔 3（对应 ESP32-S3 TOUCH7 通道）腹部
+#define BSP_TOUCH_PREV_PIN 7  ///< 翻页前一页触摸（对应 ESP32-S3 TOUCH3 通道）GPIO3 空闲
 #define BSP_TOUCH_NEXT_PIN 14 ///< 翻页后一页触摸（对应 ESP32-S3 TOUCH14 通道）GPIO14 由 LCD RST 迁出
 
 // ─── 4. ST7789 LCD 屏幕 SPI 引脚 ────────────────────────────────────────────

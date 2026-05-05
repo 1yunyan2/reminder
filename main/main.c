@@ -8,6 +8,8 @@
 #include "ui/interaction.h"
 #include "ui/reminder.h"
 #include "bsp/servo_manager.h"
+// #include "ui/whack_mole.h"
+
 static const char *TAG = "SERVO_TEST";
 
 // 舵机循环测试任务（独立运行，不阻塞 LVGL）
@@ -37,21 +39,15 @@ static void servo_test_task(void *arg)
 
 void app_main(void)
 {
+    bsp_board_t *board = bsp_board_get_instance();
     // 等待 USB-JTAG CDC 连接建立，避免打印阻塞导致看门狗触发
     vTaskDelay(pdMS_TO_TICKS(500));
 
     // NVS 初始化（reminder 的闹钟持久化依赖它）
-    esp_err_t nvs_err = nvs_flash_init();
-    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        nvs_flash_erase();
-        nvs_flash_init();
-    }
+    bsp_board_nvs_init(board);
 
     // 提醒系统初始化（含 MOCK_TIME 模式下的系统时间设置）
     reminder_init(NULL); // NULL = 暂无 TTS 回调，后续接入 session 层时替换
-
-    bsp_board_t *board = bsp_board_get_instance();
 
     // 舵机初始化（三轴缓慢归中到 90°）
     bsp_board_servo_init(board);
@@ -82,8 +78,19 @@ void app_main(void)
     // LCD 初始化
     bsp_board_lcd_init(board);
     ui_init();
+    vTaskDelay(pdMS_TO_TICKS(100));
     bsp_board_lcd_on(board);
     ESP_LOGI(TAG, "LCD 初始化完成");
+
+    // /* ========== 启动打地鼠游戏 ========== */
+    // wm_init(board->lcd_panel); // 传入 LCD panel 句柄
+    // wm_start();                // 启动游戏任务
+
+    // /* 主循环（可以继续做其他事） */
+    // while (1)
+    // {
+    //     vTaskDelay(pdMS_TO_TICKS(100));
+    // }
 
     // 6. 创建触摸扫描任务（栈分配在PSRAM，节省内部SRAM）
     BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(

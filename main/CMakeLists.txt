@@ -10,4 +10,5 @@ idf_component_register(SRCS
 "ui/ui_port.c"
 "ui/picture.c"
 "ui/font_cn_16.c"
+"ui/whack_mole.c"
 INCLUDE_DIRS ".")

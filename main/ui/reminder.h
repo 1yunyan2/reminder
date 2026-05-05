@@ -45,8 +45,8 @@
  * 1. 常量与配置宏
  * ═══════════════════════════════════════════════════════════════════ */
 
-#define REMINDER_MAX_ALARMS 8     ///< 最大闹钟数量，后续使用条件编译将多个变为？个
-#define REMINDER_MAX_TIMERS 4     /// todo<最大倒计时数量，后续使用条件编译将多倒计时变为单个，为什么会有倒计时？计算闹钟的吗？
+#define REMINDER_MAX_ALARMS 1     ///< 最大闹钟数量，后续使用条件编译将多个变为？个
+#define REMINDER_MAX_TIMERS 1     /// todo<最大倒计时数量，后续使用条件编译将多倒计时变为单个，为什么会有倒计时？计算闹钟的吗？
 #define REMINDER_MAX_CALENDARS 16 ///< 最大日历事件数量
 #define REMINDER_MSG_MAX_LEN 64   ///< 提醒消息最大长度（UTF-8 字节）
 
